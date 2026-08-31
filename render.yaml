@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: shark-btc-smc-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: SHARK_BASE_URL
+        value: https://api.sharkexchange.in
+      - key: SHARK_PAIR
+        value: BTCUSDT

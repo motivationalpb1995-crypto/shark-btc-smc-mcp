@@ -3,17 +3,13 @@ import os
 import time
 from typing import Any
 
-import httpx
-
-from app import DEFAULT_PAIR, _run_one
+from app import DEFAULT_PAIR, fetch_klines, fetch_live_price
+from advanced_smc import analyze_advanced
 
 PAIR = DEFAULT_PAIR.upper()
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", "10"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Alert only after a CLOSED 5m candle has confirmed the SMC trigger.
-# The live ticker is then used to detect the retracement into the confirmed POI.
 last_alert_key: str | None = None
 
 
@@ -25,6 +21,7 @@ async def telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM NOT CONFIGURED:\n" + text)
         return False
+    import httpx
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
@@ -32,124 +29,96 @@ async def telegram(text: str) -> bool:
     return True
 
 
-def strict_confirmed_setup(result: dict) -> tuple[bool, str]:
-    """Apply an explicit SMC checklist on top of the normalized engine output.
-
-    Required sequence:
-      1) 4H directional structure
-      2) 1H same-direction structure
-      3) 15M liquidity sweep against the intended direction
-      4) 5M MSS in the intended direction
-      5) 5M displacement
-      6) FVG and/or order block POI
-      7) entry only on POI retracement, never on chase
-    """
-    direction = result.get("direction")
-    if direction not in {"LONG", "SHORT"}:
-        return False, "No directional HTF bias"
-
-    h4 = result.get("4H", {})
-    h1 = result.get("1H", {})
-    m15 = result.get("15M", {})
-    m5 = result.get("5M", {})
-    sweep = m15.get("liquidity", {})
-    mss = m5.get("MSS", {})
-
-    if h4.get("bias") != direction_to_bias(direction):
-        return False, "4H bias not aligned"
-    if h1.get("bias") != direction_to_bias(direction):
-        return False, "1H bias not aligned"
-
-    expected_sweep = "SELL_SIDE_LIQUIDITY_SWEEP" if direction == "LONG" else "BUY_SIDE_LIQUIDITY_SWEEP"
-    expected_mss = "BULLISH_MSS" if direction == "LONG" else "BEARISH_MSS"
-    if sweep.get("type") != expected_sweep:
-        return False, "15M liquidity sweep not confirmed"
-    if mss.get("type") != expected_mss:
-        return False, "5M MSS not confirmed"
-    if not m5.get("displacement"):
-        return False, "5M displacement not confirmed"
-    if not (m5.get("FVG") or m5.get("order_block")):
-        return False, "No 5M FVG/OB POI"
-    if not result.get("POI"):
-        return False, "No usable POI"
-    return True, "FULL_SMC_CONFIRMATION"
-
-
-def direction_to_bias(direction: str) -> str:
-    return "BULLISH" if direction == "LONG" else "BEARISH"
+def strict_advanced(result: dict) -> tuple[bool, str]:
+    if result.get("setup") != "VALID":
+        return False, result.get("reason", "No advanced SMC confirmation")
+    checks = result.get("checks", {})
+    required = ("HTF_alignment", "external_liquidity_sweep", "MSS", "displacement", "FVG_or_OB", "POI_confluence")
+    if not all(checks.get(k) for k in required):
+        return False, "Advanced SMC checklist incomplete"
+    if result.get("score", 0) < 85:
+        return False, "SMC score below 85"
+    poi = result.get("POI")
+    if not poi:
+        return False, "No POI"
+    return True, "ADVANCED_SMC_CONFIRMED"
 
 
 def alert_key(result: dict) -> str:
-    m5 = result.get("5M", {})
-    mss = m5.get("MSS", {})
     poi = result.get("POI") or {}
-    return f"{result.get('direction')}:{mss.get('level')}:{poi.get('low')}:{poi.get('high')}"
+    ms = (result.get("5M") or {}).get("MSS") or {}
+    return f"{result.get('direction')}:{ms.get('level')}:{poi.get('low')}:{poi.get('high')}"
 
 
 def build_message(ex: str, result: dict) -> str:
-    direction = result["direction"]
+    d = result["direction"]
     poi = result["POI"]
+    checks = result["checks"]
     return (
         f"🚨 ENTRY AA GAYA — BTCUSDT PERPETUAL\n\n"
-        f"Exchange: {ex}\nDirection: {direction}\n"
+        f"Exchange: {ex}\nDirection: {d}\nSMC Score: {result['score']}/100\n"
         f"Live Price: {_fmt(result.get('live_price'))}\n"
         f"Entry Zone: {_fmt(poi.get('low'))} – {_fmt(poi.get('high'))}\n"
         f"SL: {_fmt(result.get('stop_loss'))}\n"
-        f"TP1 (2R): {_fmt(result.get('take_profit_1'))}\n"
-        f"TP2 (3R): {_fmt(result.get('take_profit_2'))}\n\n"
-        f"SMC CHECKLIST\n"
-        f"4H bias: ✅\n1H structure: ✅\n"
-        f"15M liquidity sweep: ✅\n5M MSS: ✅\n"
-        f"5M displacement: ✅\nFVG/OB POI: ✅\n"
+        f"TP1: {_fmt(result.get('take_profit_1'))}\n"
+        f"TP2: {_fmt(result.get('take_profit_2'))}\n\n"
+        f"ADVANCED SMC CHECKLIST\n"
+        f"4H + 1H HTF alignment: {'✅' if checks.get('HTF_alignment') else '❌'}\n"
+        f"15M external liquidity sweep: {'✅' if checks.get('external_liquidity_sweep') else '❌'}\n"
+        f"5M MSS: {'✅' if checks.get('MSS') else '❌'}\n"
+        f"5M displacement: {'✅' if checks.get('displacement') else '❌'}\n"
+        f"FVG / Order Block: {'✅' if checks.get('FVG_or_OB') else '❌'}\n"
+        f"POI confluence / breaker: {'✅' if checks.get('POI_confluence') else '❌'}\n"
+        f"Premium/Discount filter: ✅\n"
         f"Entry: POI retracement only\n\n"
         f"⚠️ Educational setup — risk management required."
     )
 
 
+async def run_exchange(ex: str) -> dict:
+    h4, h1, m15, m5 = await asyncio.gather(
+        fetch_klines(ex, PAIR, "4h", 300),
+        fetch_klines(ex, PAIR, "1h", 300),
+        fetch_klines(ex, PAIR, "15m", 300),
+        fetch_klines(ex, PAIR, "5m", 300),
+    )
+    live = await fetch_live_price(ex, PAIR)
+    return analyze_advanced(h4, h1, m15, m5, live)
+
+
 async def scan_once() -> None:
     global last_alert_key
-    results = await asyncio.gather(
-        _run_one("BINANCE", PAIR),
-        _run_one("BYBIT", PAIR),
-        return_exceptions=True,
-    )
-
+    results = await asyncio.gather(run_exchange("BINANCE"), run_exchange("BYBIT"), return_exceptions=True)
     valid: list[tuple[str, dict]] = []
     for ex, item in zip(("BINANCE", "BYBIT"), results):
         if isinstance(item, Exception):
             print(f"{ex} error: {item}")
             continue
-        ok, why = strict_confirmed_setup(item)
-        print(f"{time.strftime('%H:%M:%S')} {ex}: {item.get('live_price')} {item.get('direction')} {ok} {why}")
+        ok, why = strict_advanced(item)
+        print(f"{time.strftime('%H:%M:%S')} {ex}: {item.get('live_price')} {item.get('direction')} score={item.get('score')} {ok} {why}")
         if ok:
             valid.append((ex, item))
 
-    # Highest-quality alert requires both exchanges to agree on direction and have
-    # their own complete SMC confirmation. This avoids exchange-specific noise.
-    if len(valid) != 2:
-        return
-    if valid[0][1]["direction"] != valid[1][1]["direction"]:
+    if len(valid) != 2 or valid[0][1].get("direction") != valid[1][1].get("direction"):
         return
 
-    b_key = alert_key(valid[0][1])
-    y_key = alert_key(valid[1][1])
-    key = f"{valid[0][1]['direction']}|{b_key}|{y_key}"
+    key = "|".join(alert_key(x[1]) for x in valid)
     if key == last_alert_key:
         return
 
-    # Alert when the current live price is actually inside each exchange's POI.
-    # This is the entry event, not merely the MSS event.
+    # Alert only when the live price is actually inside the execution POI on
+    # at least one exchange; direction must already agree on both exchanges.
     for ex, item in valid:
         poi = item["POI"]
         px = item["live_price"]
         if poi["low"] <= px <= poi["high"]:
-            last_alert_key = key
-            await telegram(build_message(ex, item))
-            break
+            if await telegram(build_message(ex, item)):
+                last_alert_key = key
+            return
 
 
 async def main() -> None:
-    print(f"SMC monitor started: {PAIR} | poll={POLL_SECONDS}s | Binance + Bybit")
+    print(f"ADVANCED SMC monitor started: {PAIR} | poll={POLL_SECONDS}s | Binance + Bybit")
     while True:
         try:
             await scan_once()

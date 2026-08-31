@@ -3,12 +3,15 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
+import uvicorn
 
 from advanced_smc import analyze_advanced
 
 mcp = FastMCP("BTCUSDT Perpetual SMC")
 
-# Public market-data only. No API keys are required for this SMC analysis.
 DEFAULT_PAIR = "BTCUSDT"
 CONTRACT_TYPE = "PERPETUAL"
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
@@ -46,18 +49,10 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
 
     async with httpx.AsyncClient(timeout=20) as client:
         if exchange == "BINANCE":
-            data = await _get_json(
-                client,
-                f"{BINANCE_BASE_URL}/fapi/v1/klines",
-                {"symbol": symbol, "interval": interval, "limit": limit},
-            )
+            data = await _get_json(client, f"{BINANCE_BASE_URL}/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
             rows = data
         else:
-            data = await _get_json(
-                client,
-                f"{BYBIT_BASE_URL}/v5/market/kline",
-                {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit},
-            )
+            data = await _get_json(client, f"{BYBIT_BASE_URL}/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit})
             if data.get("retCode") not in (None, 0):
                 raise ValueError(f"Bybit error: {data.get('retMsg')}")
             rows = data.get("result", {}).get("list", [])
@@ -66,36 +61,15 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
     for row in rows or []:
         try:
             if exchange == "BINANCE":
-                candles.append(
-                    {
-                        "time": int(row[0]),
-                        "open": float(row[1]),
-                        "high": float(row[2]),
-                        "low": float(row[3]),
-                        "close": float(row[4]),
-                        "endTime": int(row[6]),
-                        "volume": float(row[5]),
-                    }
-                )
+                candles.append({"time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "endTime": int(row[6]), "volume": float(row[5])})
             else:
-                candles.append(
-                    {
-                        "time": int(row[0]),
-                        "open": float(row[1]),
-                        "high": float(row[2]),
-                        "low": float(row[3]),
-                        "close": float(row[4]),
-                        "endTime": int(row[0]),
-                        "volume": float(row[5]),
-                    }
-                )
+                candles.append({"time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "endTime": int(row[0]), "volume": float(row[5])})
         except (IndexError, TypeError, ValueError):
             continue
 
     candles.sort(key=lambda x: x["time"])
     if len(candles) < 50:
         raise ValueError(f"Not enough candles from {exchange} for {symbol} {interval}: {len(candles)}")
-    # Never analyze the still-forming candle. The live ticker remains separate.
     return candles[:-1]
 
 
@@ -114,36 +88,22 @@ async def fetch_live_price(exchange: str, pair: str) -> float:
 
 async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
     import asyncio
-
     symbol = _validate_pair(pair)
     h4, h1, m15, m5 = await asyncio.gather(
-        fetch_klines(exchange, symbol, "4h"),
-        fetch_klines(exchange, symbol, "1h"),
-        fetch_klines(exchange, symbol, "15m"),
-        fetch_klines(exchange, symbol, "5m"),
+        fetch_klines(exchange, symbol, "4h"), fetch_klines(exchange, symbol, "1h"),
+        fetch_klines(exchange, symbol, "15m"), fetch_klines(exchange, symbol, "5m"),
     )
     live = await fetch_live_price(exchange, symbol)
     analysis = analyze_advanced(h4, h1, m15, m5, live)
-    return {
-        "exchange": exchange,
-        "pair": symbol,
-        "contract_type": CONTRACT_TYPE,
-        "engine": "ADVANCED_SMC",
-        **analysis,
-    }
+    return {"exchange": exchange, "pair": symbol, "contract_type": CONTRACT_TYPE, "engine": "ADVANCED_SMC", **analysis}
 
 
 async def _run_smc(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
     import asyncio
-
     symbol = _validate_pair(pair)
     exchange = exchange.upper()
     if exchange == "BOTH":
-        results = await asyncio.gather(
-            _run_one("BINANCE", symbol),
-            _run_one("BYBIT", symbol),
-            return_exceptions=True,
-        )
+        results = await asyncio.gather(_run_one("BINANCE", symbol), _run_one("BYBIT", symbol), return_exceptions=True)
         output: dict[str, Any] = {}
         for name, result in zip(("BINANCE", "BYBIT"), results):
             output[name] = {"error": str(result)} if isinstance(result, Exception) else result
@@ -157,15 +117,7 @@ async def _run_smc(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
                 consensus = "NO_CONSENSUS"
         else:
             consensus = "PARTIAL_DATA"
-        return {
-            "pair": symbol,
-            "contract_type": CONTRACT_TYPE,
-            "mode": "BINANCE + BYBIT",
-            "engine": "ADVANCED_SMC",
-            "consensus": consensus,
-            "BINANCE": b,
-            "BYBIT": y,
-        }
+        return {"pair": symbol, "contract_type": CONTRACT_TYPE, "mode": "BINANCE + BYBIT", "engine": "ADVANCED_SMC", "consensus": consensus, "BINANCE": b, "BYBIT": y}
     if exchange not in EXCHANGES:
         raise ValueError("exchange must be BINANCE, BYBIT, or BOTH")
     return await _run_one(exchange, symbol)
@@ -190,34 +142,42 @@ async def get_btcusdt_perpetual_market_data(exchange: str = "BOTH", pair: str = 
 
     async def one(ex: str) -> dict:
         import asyncio
-
         live, h4, h1, m15, m5 = await asyncio.gather(
-            fetch_live_price(ex, symbol),
-            fetch_klines(ex, symbol, "4h"),
-            fetch_klines(ex, symbol, "1h"),
-            fetch_klines(ex, symbol, "15m"),
-            fetch_klines(ex, symbol, "5m"),
+            fetch_live_price(ex, symbol), fetch_klines(ex, symbol, "4h"), fetch_klines(ex, symbol, "1h"),
+            fetch_klines(ex, symbol, "15m"), fetch_klines(ex, symbol, "5m"),
         )
-        return {
-            "exchange": ex,
-            "pair": symbol,
-            "contract_type": CONTRACT_TYPE,
-            "live_price": live,
-            "4h": h4,
-            "1h": h1,
-            "15m": m15,
-            "5m": m5,
-        }
+        return {"exchange": ex, "pair": symbol, "contract_type": CONTRACT_TYPE, "live_price": live, "4h": h4, "1h": h1, "15m": m15, "5m": m5}
 
     if exchange.upper() == "BOTH":
         import asyncio
-
         b, y = await asyncio.gather(one("BINANCE"), one("BYBIT"))
         return {"BINANCE": b, "BYBIT": y}
     return await one(exchange.upper())
 
 
+async def health(request):
+    return JSONResponse({"status": "ok", "service": "Shark BTC Advanced SMC", "pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "exchanges": ["BINANCE", "BYBIT"]})
+
+
+async def public_smc(request):
+    try:
+        exchange = request.query_params.get("exchange", "BOTH").upper()
+        pair = request.query_params.get("pair", DEFAULT_PAIR)
+        result = await _run_smc(exchange, pair)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
+
+
+# Public read-only HTTP API. This works from a normal browser and does not require MCP.
+public_app = Starlette(routes=[
+    Route("/", health, methods=["GET"]),
+    Route("/health", health, methods=["GET"]),
+    Route("/api/smc", public_smc, methods=["GET"]),
+    Mount("/mcp", app=mcp.http_app(path="/mcp", transport="streamable-http")),
+])
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    # Streamable HTTP exposes the standard /mcp endpoint expected by MCP clients.
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
+    uvicorn.run(public_app, host="0.0.0.0", port=port)

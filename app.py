@@ -1,237 +1,126 @@
-import asyncio
 import os
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
 
-mcp = FastMCP("BTC SMC Futures")
+mcp = FastMCP("Shark BTC SMC")
 
-DEFAULT_PAIR = os.getenv("DEFAULT_PAIR", "BTCUSDT")
-BINANCE_SPOT_URL = os.getenv("BINANCE_SPOT_URL", "https://api.binance.com")
-BINANCE_FUTURES_URL = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
-BYBIT_URL = os.getenv("BYBIT_URL", "https://api.bybit.com")
+# Keep the existing Shark exchange/data source unchanged.
+BASE_URL = os.getenv("SHARK_BASE_URL", "https://api.sharkexchange.in")
+DEFAULT_PAIR = os.getenv("SHARK_PAIR", "BTCUSDT")
+CONTRACT_TYPE = "PERPETUAL"
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
 
 
-async def _get(url: str, params: dict[str, Any]) -> Any:
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
+# ---------------------------------------------------------
+# SHARK MARKET DATA — BTCUSDT PERPETUAL
+# ---------------------------------------------------------
 
+async def fetch_klines(
+    pair: str,
+    interval: str,
+    limit: int = 200,
+    price_type: str = "MARK_PRICE",
+) -> list[dict]:
+    """Fetch existing Shark BTCUSDT perpetual candles without changing exchange."""
+    if interval not in VALID_INTERVALS:
+        raise ValueError("Interval must be one of: 5m, 15m, 1h, 4h")
 
-def _normalize_candle(c: list[Any]) -> dict:
-    return {
-        "time": int(c[0]),
-        "open": float(c[1]),
-        "high": float(c[2]),
-        "low": float(c[3]),
-        "close": float(c[4]),
-        "volume": float(c[5]),
-        "endTime": int(c[6]) if len(c) > 6 else None,
+    limit = min(max(int(limit), 20), 1000)
+    payload = {
+        "pair": pair or DEFAULT_PAIR,
+        "interval": interval,
+        "limit": limit,
     }
 
+    url = f"{BASE_URL}/v1/market/klines?priceType={price_type}"
 
-async def fetch_binance_klines(pair: str, interval: str, limit: int = 200) -> list[dict]:
-    if interval not in VALID_INTERVALS:
-        raise ValueError("Interval must be one of: 5m, 15m, 1h, 4h")
-    limit = min(max(int(limit), 20), 1500)
-    data = await _get(
-        f"{BINANCE_FUTURES_URL}/fapi/v1/klines",
-        {"symbol": (pair or DEFAULT_PAIR).upper(), "interval": interval, "limit": limit},
-    )
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    if isinstance(data, dict):
+        for key in ("data", "result", "rows", "klines"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+
     if not isinstance(data, list):
-        raise ValueError(f"Unexpected Binance Futures response: {data}")
-    return sorted([_normalize_candle(c) for c in data if isinstance(c, list) and len(c) >= 6], key=lambda x: x["time"])
+        raise ValueError(f"Unexpected Shark kline response: {data}")
 
-
-async def fetch_bybit_klines(pair: str, interval: str, limit: int = 200) -> list[dict]:
-    if interval not in VALID_INTERVALS:
-        raise ValueError("Interval must be one of: 5m, 15m, 1h, 4h")
-    limit = min(max(int(limit), 20), 1000)
-    interval_map = {"5m": "5", "15m": "15", "1h": "60", "4h": "240"}
-    data = await _get(
-        f"{BYBIT_URL}/v5/market/kline",
-        {
-            "category": "linear",
-            "symbol": (pair or DEFAULT_PAIR).upper(),
-            "interval": interval_map[interval],
-            "limit": limit,
-        },
-    )
-    if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise ValueError(f"Unexpected Bybit response: {data}")
-    rows = data.get("result", {}).get("list", [])
     candles = []
-    for c in rows:
-        if not isinstance(c, list) or len(c) < 6:
+    for c in data:
+        if not isinstance(c, dict):
             continue
-        candles.append({
-            "time": int(c[0]),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5]),
-            "endTime": None,
-        })
+        try:
+            candles.append({
+                "time": int(c["startTime"]),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "endTime": int(c["endTime"]),
+                "volume": float(c.get("volume", 0)),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(candles) < 20:
+        raise ValueError(f"Not enough valid candles returned for {pair} {interval}")
+
     candles.sort(key=lambda x: x["time"])
     return candles
 
 
-async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 200) -> list[dict]:
-    exchange = exchange.lower()
-    if exchange == "binance":
-        candles = await fetch_binance_klines(pair, interval, limit)
-    elif exchange == "bybit":
-        candles = await fetch_bybit_klines(pair, interval, limit)
-    else:
-        raise ValueError("Exchange must be 'binance' or 'bybit'")
-    if len(candles) < 20:
-        raise ValueError(f"Not enough valid candles returned for {exchange} {pair} {interval}")
-    return candles
+async def _perpetual_candles(interval: str, limit: int = 200) -> list[dict]:
+    """Canonical BTCUSDT perpetual data path; exchange remains Shark."""
+    return await fetch_klines(DEFAULT_PAIR, interval, limit, "MARK_PRICE")
 
 
-async def fetch_binance_futures_snapshot(pair: str) -> dict:
-    symbol = (pair or DEFAULT_PAIR).upper()
-    ticker, mark, book, oi = await asyncio.gather(
-        _get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr", {"symbol": symbol}),
-        _get(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex", {"symbol": symbol}),
-        _get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/bookTicker", {"symbol": symbol}),
-        _get(f"{BINANCE_FUTURES_URL}/fapi/v1/openInterest", {"symbol": symbol}),
-    )
-    depth = await _get(f"{BINANCE_FUTURES_URL}/fapi/v1/depth", {"symbol": symbol, "limit": 20})
-    return {
-        "exchange": "binance",
-        "market_type": "USDT-M perpetual futures",
-        "symbol": symbol,
-        "last_price": float(ticker["lastPrice"]),
-        "price_change_24h_pct": float(ticker["priceChangePercent"]),
-        "mark_price": float(mark["markPrice"]),
-        "index_price": float(mark["indexPrice"]),
-        "funding_rate": float(mark["lastFundingRate"]),
-        "next_funding_time": int(mark["nextFundingTime"]),
-        "best_ask": float(book["askPrice"]),
-        "best_ask_qty": float(book["askQty"]),
-        "best_bid": float(book["bidPrice"]),
-        "best_bid_qty": float(book["bidQty"]),
-        "open_interest": float(oi["openInterest"]),
-        "order_book": {
-            "bids": [[float(x[0]), float(x[1])] for x in depth.get("bids", [])],
-            "asks": [[float(x[0]), float(x[1])] for x in depth.get("asks", [])],
-        },
-    }
+# ---------------------------------------------------------
+# BASIC MARKET TOOLS — compatibility preserved
+# ---------------------------------------------------------
 
-
-async def fetch_bybit_futures_snapshot(pair: str) -> dict:
-    symbol = (pair or DEFAULT_PAIR).upper()
-    ticker = await _get(f"{BYBIT_URL}/v5/market/tickers", {"category": "linear", "symbol": symbol})
-    if ticker.get("retCode") != 0 or not ticker.get("result", {}).get("list"):
-        raise ValueError(f"Unexpected Bybit ticker response: {ticker}")
-    t = ticker["result"]["list"][0]
-    orderbook, oi = await asyncio.gather(
-        _get(f"{BYBIT_URL}/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": 20}),
-        _get(f"{BYBIT_URL}/v5/market/open-interest", {"category": "linear", "symbol": symbol, "intervalTime": "5min", "limit": 1}),
-    )
-    if orderbook.get("retCode") != 0:
-        raise ValueError(f"Unexpected Bybit order book response: {orderbook}")
-    oi_rows = oi.get("result", {}).get("list", [])
-    return {
-        "exchange": "bybit",
-        "market_type": "USDT perpetual futures",
-        "symbol": symbol,
-        "last_price": float(t["lastPrice"]),
-        "price_change_24h_pct": float(t["price24hPcnt"]) * 100,
-        "mark_price": float(t["markPrice"]),
-        "index_price": float(t["indexPrice"]),
-        "funding_rate": float(t["fundingRate"]),
-        "next_funding_time": int(t["nextFundingTime"]),
-        "best_ask": float(t["ask1Price"]),
-        "best_ask_qty": float(t["ask1Size"]),
-        "best_bid": float(t["bid1Price"]),
-        "best_bid_qty": float(t["bid1Size"]),
-        "open_interest": float(oi_rows[0]["openInterest"]) if oi_rows else None,
-        "order_book": {
-            "bids": [[float(x[0]), float(x[1])] for x in orderbook.get("result", {}).get("b", [])],
-            "asks": [[float(x[0]), float(x[1])] for x in orderbook.get("result", {}).get("a", [])],
-        },
-    }
-
-
-async def fetch_futures_snapshot(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
-    exchange = exchange.lower()
-    if exchange == "binance":
-        return await fetch_binance_futures_snapshot(pair)
-    if exchange == "bybit":
-        return await fetch_bybit_futures_snapshot(pair)
-    raise ValueError("Exchange must be 'binance' or 'bybit'")
+@mcp.tool
+async def get_btc_4h(limit: int = 200) -> dict:
+    return {"pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "interval": "4h", "candles": await _perpetual_candles("4h", limit)}
 
 
 @mcp.tool
-async def get_binance_btc_futures_snapshot() -> dict:
-    """BTCUSDT USDT-M perpetual snapshot: last/mark/index price, funding, bid/ask, OI and order book."""
-    return await fetch_futures_snapshot("binance")
+async def get_btc_1h(limit: int = 200) -> dict:
+    return {"pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "interval": "1h", "candles": await _perpetual_candles("1h", limit)}
 
 
 @mcp.tool
-async def get_bybit_btc_futures_snapshot() -> dict:
-    """BTCUSDT linear perpetual snapshot: last/mark/index price, funding, bid/ask, OI and order book."""
-    return await fetch_futures_snapshot("bybit")
+async def get_btc_15m(limit: int = 200) -> dict:
+    return {"pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "interval": "15m", "candles": await _perpetual_candles("15m", limit)}
 
 
 @mcp.tool
-async def get_btc_futures_comparison() -> dict:
-    """Compare the same BTCUSDT perpetual contract data across Binance and Bybit."""
-    binance, bybit = await asyncio.gather(
-        fetch_futures_snapshot("binance"),
-        fetch_futures_snapshot("bybit"),
-    )
-    return {"symbol": DEFAULT_PAIR, "binance": binance, "bybit": bybit}
+async def get_btc_5m(limit: int = 200) -> dict:
+    return {"pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "interval": "5m", "candles": await _perpetual_candles("5m", limit)}
 
 
-@mcp.tool
-async def get_binance_btc_4h(limit: int = 200) -> dict:
-    return {"exchange": "binance", "market_type": "USDT-M perpetual futures", "pair": DEFAULT_PAIR, "interval": "4h", "candles": await fetch_klines("binance", DEFAULT_PAIR, "4h", limit)}
-
-
-@mcp.tool
-async def get_binance_btc_1h(limit: int = 200) -> dict:
-    return {"exchange": "binance", "market_type": "USDT-M perpetual futures", "pair": DEFAULT_PAIR, "interval": "1h", "candles": await fetch_klines("binance", DEFAULT_PAIR, "1h", limit)}
-
-
-@mcp.tool
-async def get_binance_btc_15m(limit: int = 200) -> dict:
-    return {"exchange": "binance", "market_type": "USDT-M perpetual futures", "pair": DEFAULT_PAIR, "interval": "15m", "candles": await fetch_klines("binance", DEFAULT_PAIR, "15m", limit)}
-
-
-@mcp.tool
-async def get_binance_btc_5m(limit: int = 200) -> dict:
-    return {"exchange": "binance", "market_type": "USDT-M perpetual futures", "pair": DEFAULT_PAIR, "interval": "5m", "candles": await fetch_klines("binance", DEFAULT_PAIR, "5m", limit)}
-
-
-@mcp.tool
-async def get_bybit_btc_4h(limit: int = 200) -> dict:
-    return {"exchange": "bybit", "market_type": "USDT perpetual futures", "pair": DEFAULT_PAIR, "interval": "4h", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "4h", limit)}
-
-
-@mcp.tool
-async def get_bybit_btc_1h(limit: int = 200) -> dict:
-    return {"exchange": "bybit", "market_type": "USDT perpetual futures", "pair": DEFAULT_PAIR, "interval": "1h", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "1h", limit)}
-
-
-@mcp.tool
-async def get_bybit_btc_15m(limit: int = 200) -> dict:
-    return {"exchange": "bybit", "market_type": "USDT perpetual futures", "pair": DEFAULT_PAIR, "interval": "15m", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "15m", limit)}
-
-
-@mcp.tool
-async def get_bybit_btc_5m(limit: int = 200) -> dict:
-    return {"exchange": "bybit", "market_type": "USDT perpetual futures", "pair": DEFAULT_PAIR, "interval": "5m", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "5m", limit)}
-
+# ---------------------------------------------------------
+# SMC HELPERS
+# ---------------------------------------------------------
 
 def body(c: dict) -> float:
     return abs(c["close"] - c["open"])
+
+
+def bullish(c: dict) -> bool:
+    return c["close"] > c["open"]
+
+
+def bearish(c: dict) -> bool:
+    return c["close"] < c["open"]
 
 
 def recent_high(candles: list[dict], lookback: int = 20) -> float:
@@ -245,10 +134,12 @@ def recent_low(candles: list[dict], lookback: int = 20) -> float:
 def detect_structure(candles: list[dict], lookback: int = 20) -> dict:
     if len(candles) < lookback + 2:
         return {"structure": "UNKNOWN", "bos": False}
+
     current = candles[-1]
-    previous = candles[-lookback-1:-1]
+    previous = candles[-lookback - 1:-1]
     previous_high = max(c["high"] for c in previous)
     previous_low = min(c["low"] for c in previous)
+
     if current["close"] > previous_high:
         return {"structure": "BULLISH", "bos": True, "level": previous_high}
     if current["close"] < previous_low:
@@ -270,7 +161,7 @@ def detect_fvg(candles: list[dict]) -> dict | None:
 def detect_mss(candles: list[dict], lookback: int = 8) -> str:
     if len(candles) < lookback + 3:
         return "NONE"
-    recent = candles[-lookback-1:-1]
+    recent = candles[-lookback - 1:-1]
     current = candles[-1]
     high = max(c["high"] for c in recent)
     low = min(c["low"] for c in recent)
@@ -284,113 +175,146 @@ def detect_mss(candles: list[dict], lookback: int = 8) -> str:
 def detect_displacement(candles: list[dict]) -> bool:
     if len(candles) < 10:
         return False
-    average_body = sum(body(c) for c in candles[-10:-1]) / 9
+    recent_bodies = [body(c) for c in candles[-10:-1]]
+    average_body = sum(recent_bodies) / len(recent_bodies)
     return body(candles[-1]) >= average_body * 1.5
 
 
-def liquidity_sweep(candles: list[dict], lookback: int = 20) -> dict:
-    if len(candles) < lookback + 2:
-        return {"type": "NONE"}
-    prior = candles[-lookback-1:-1]
+def detect_liquidity_sweep(candles: list[dict], lookback: int = 10) -> str:
+    """Detect a simple wick sweep of recent liquidity."""
+    if len(candles) < lookback + 1:
+        return "NONE"
     current = candles[-1]
+    prior = candles[-lookback - 1:-1]
     prior_high = max(c["high"] for c in prior)
     prior_low = min(c["low"] for c in prior)
+
     if current["high"] > prior_high and current["close"] < prior_high:
-        return {"type": "BUY_SIDE_SWEEP", "level": prior_high}
+        return "BUY_SIDE_SWEEP"
     if current["low"] < prior_low and current["close"] > prior_low:
-        return {"type": "SELL_SIDE_SWEEP", "level": prior_low}
-    return {"type": "NONE", "buy_side": prior_high, "sell_side": prior_low}
+        return "SELL_SIDE_SWEEP"
+    return "NONE"
 
 
-async def analyze_exchange(exchange: str) -> dict:
-    h4, h1, m15, m5, snapshot = await asyncio.gather(
-        fetch_klines(exchange, DEFAULT_PAIR, "4h", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "1h", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "15m", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "5m", 200),
-        fetch_futures_snapshot(exchange, DEFAULT_PAIR),
-    )
-    h4s, h1s, m15s = detect_structure(h4), detect_structure(h1), detect_structure(m15)
-    m15_fvg, m5_fvg = detect_fvg(m15), detect_fvg(m5)
-    m5_mss, displacement = detect_mss(m5), detect_displacement(m5)
-    sweep = liquidity_sweep(m5)
-    price = snapshot["last_price"]
-    bias = h4s["structure"] if h4s["structure"] in {"BULLISH", "BEARISH"} else h1s["structure"] if h1s["structure"] in {"BULLISH", "BEARISH"} else "NEUTRAL"
-    setup, direction = "WAIT", "NONE"
+# ---------------------------------------------------------
+# FULL SMC ANALYSIS — BTCUSDT PERPETUAL
+# ---------------------------------------------------------
+
+async def _run_smc() -> dict:
+    h4 = await _perpetual_candles("4h", 200)
+    h1 = await _perpetual_candles("1h", 200)
+    m15 = await _perpetual_candles("15m", 200)
+    m5 = await _perpetual_candles("5m", 200)
+
+    h4_structure = detect_structure(h4)
+    h1_structure = detect_structure(h1)
+    m15_structure = detect_structure(m15)
+    m15_fvg = detect_fvg(m15)
+    m5_fvg = detect_fvg(m5)
+    m5_mss = detect_mss(m5)
+    displacement = detect_displacement(m5)
+    sweep = detect_liquidity_sweep(m5)
+    price = m5[-1]["close"]
+
+    if h4_structure["structure"] in {"BULLISH", "BEARISH"}:
+        bias = h4_structure["structure"]
+    elif h1_structure["structure"] in {"BULLISH", "BEARISH"}:
+        bias = h1_structure["structure"]
+    else:
+        bias = "NEUTRAL"
+
+    setup = "WAIT"
+    direction = "NONE"
+
+    # Conservative SMC chain: HTF alignment + liquidity sweep + MSS + displacement.
     if bias == "BULLISH":
         direction = "LONG"
-        if sweep["type"] == "SELL_SIDE_SWEEP" and m5_mss == "BULLISH_MSS" and displacement:
+        if (
+            h1_structure["structure"] == "BULLISH"
+            and sweep == "SELL_SIDE_SWEEP"
+            and m5_mss == "BULLISH_MSS"
+            and displacement
+        ):
             setup = "VALID_LONG"
     elif bias == "BEARISH":
         direction = "SHORT"
-        if sweep["type"] == "BUY_SIDE_SWEEP" and m5_mss == "BEARISH_MSS" and displacement:
+        if (
+            h1_structure["structure"] == "BEARISH"
+            and sweep == "BUY_SIDE_SWEEP"
+            and m5_mss == "BEARISH_MSS"
+            and displacement
+        ):
             setup = "VALID_SHORT"
+
     entry = price
     sl = tp1 = tp2 = None
     rr = None
+
     if setup == "VALID_LONG":
         sl = recent_low(m5, 20)
         risk = entry - sl
         if risk > 0:
-            tp1, tp2, rr = entry + risk * 2, entry + risk * 3, {"TP1": 2.0, "TP2": 3.0}
+            tp1 = entry + risk * 2
+            tp2 = entry + risk * 3
+            rr = {"TP1": 2.0, "TP2": 3.0}
     elif setup == "VALID_SHORT":
         sl = recent_high(m5, 20)
         risk = sl - entry
         if risk > 0:
-            tp1, tp2, rr = entry - risk * 2, entry - risk * 3, {"TP1": 2.0, "TP2": 3.0}
+            tp1 = entry - risk * 2
+            tp2 = entry - risk * 3
+            rr = {"TP1": 2.0, "TP2": 3.0}
+
+    poi = m15_fvg or m5_fvg
+
     return {
-        "exchange": exchange,
-        "market_type": snapshot["market_type"],
+        "exchange": "SHARK",
         "pair": DEFAULT_PAIR,
-        "market": snapshot,
+        "contract_type": CONTRACT_TYPE,
+        "price_type": "MARK_PRICE",
         "current_price": price,
         "bias": bias,
         "direction": direction,
         "setup": setup,
-        "4H": {"structure": h4s},
-        "1H": {"structure": h1s},
-        "15M": {"structure": m15s, "FVG": m15_fvg},
+        "4H": {"structure": h4_structure},
+        "1H": {"structure": h1_structure},
+        "15M": {"structure": m15_structure, "FVG": m15_fvg},
         "5M": {"MSS": m5_mss, "displacement": displacement, "liquidity_sweep": sweep, "FVG": m5_fvg},
-        "POI": m15_fvg or m5_fvg,
+        "POI": poi,
         "entry": entry,
         "stop_loss": sl,
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "risk_reward": rr,
-        "trade_action": "WAIT FOR LIQUIDITY + MSS + DISPLACEMENT + RETEST" if setup == "WAIT" else "SMC SETUP DETECTED - MANUAL REVIEW REQUIRED",
+        "trade_action": "WAIT FOR CONFIRMATION" if setup == "WAIT" else "SMC SETUP DETECTED - MANUAL REVIEW REQUIRED",
     }
 
 
 @mcp.tool
-async def get_btc_smc_analysis(exchange: str = "binance") -> dict:
-    """Multi-timeframe BTCUSDT perpetual SMC analysis using Binance or Bybit futures data."""
-    if exchange.lower() not in {"binance", "bybit"}:
-        raise ValueError("Exchange must be 'binance' or 'bybit'")
-    return await analyze_exchange(exchange.lower())
+async def get_btc_smc_analysis() -> dict:
+    """BTCUSDT perpetual SMC: 4H -> 1H -> 15M -> 5M."""
+    return await _run_smc()
 
 
 @mcp.tool
-async def get_btc_smc_comparison() -> dict:
-    """Compare BTCUSDT perpetual SMC state across Binance and Bybit."""
-    binance, bybit = await asyncio.gather(analyze_exchange("binance"), analyze_exchange("bybit"))
-    agreement = binance["bias"] == bybit["bias"] and binance["direction"] == bybit["direction"]
-    return {"pair": DEFAULT_PAIR, "market_type": "USDT perpetual futures", "binance": binance, "bybit": bybit, "exchange_agreement": agreement}
+async def get_btcusdt_perpetual_smc_analysis() -> dict:
+    """Explicit BTCUSDT Perpetual SMC tool; uses the existing Shark exchange unchanged."""
+    return await _run_smc()
 
 
 @mcp.tool
-async def get_btc_market_data(exchange: str = "binance") -> dict:
-    """Return BTCUSDT perpetual futures snapshot and 4H/1H/15M/5M candles."""
-    exchange = exchange.lower()
-    if exchange not in {"binance", "bybit"}:
-        raise ValueError("Exchange must be 'binance' or 'bybit'")
-    h4, h1, m15, m5, snapshot = await asyncio.gather(
-        fetch_klines(exchange, DEFAULT_PAIR, "4h", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "1h", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "15m", 200),
-        fetch_klines(exchange, DEFAULT_PAIR, "5m", 200),
-        fetch_futures_snapshot(exchange, DEFAULT_PAIR),
-    )
-    return {"exchange": exchange, "market_type": snapshot["market_type"], "pair": DEFAULT_PAIR, "snapshot": snapshot, "4h": h4, "1h": h1, "15m": m15, "5m": m5}
+async def get_btc_smc_data() -> dict:
+    """Return existing Shark BTCUSDT perpetual 4H/1H/15M/5M candles."""
+    return {
+        "exchange": "SHARK",
+        "pair": DEFAULT_PAIR,
+        "contract_type": CONTRACT_TYPE,
+        "price_type": "MARK_PRICE",
+        "4h": await _perpetual_candles("4h", 200),
+        "1h": await _perpetual_candles("1h", 200),
+        "15m": await _perpetual_candles("15m", 200),
+        "5m": await _perpetual_candles("5m", 200),
+    }
 
 
 if __name__ == "__main__":

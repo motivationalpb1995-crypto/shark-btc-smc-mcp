@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -6,6 +7,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 from fastmcp import FastMCP
+from PIL import Image, ImageDraw, ImageFont
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -133,6 +135,82 @@ def _fmt_price(value: Any) -> str:
         return str(value)
 
 
+def _make_signal_chart(pair: str, exchange: str, result: dict[str, Any], candles: list[dict]) -> bytes:
+    """Create a compact 5m candlestick chart for Telegram signal alerts."""
+    width, height = 1400, 820
+    img = Image.new("RGB", (width, height), "#101114")
+    draw = ImageDraw.Draw(img)
+    try:
+        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 42)
+        body_font = ImageFont.truetype("DejaVuSans.ttf", 25)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 21)
+    except OSError:
+        title_font = body_font = small_font = ImageFont.load_default()
+
+    candles = candles[-90:]
+    if not candles:
+        raise ValueError("No chart candles available")
+    left, right, top, bottom = 80, 1320, 150, 700
+    lows = [float(c["low"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    extra = max((max(highs) - min(lows)) * 0.08, 0.01)
+    lo, hi = min(lows) - extra, max(highs) + extra
+
+    def y(price: float) -> float:
+        return bottom - (price - lo) / (hi - lo) * (bottom - top)
+
+    draw.text((60, 45), f"🦈 SHARK SMC  |  {pair} PERPETUAL", font=title_font, fill="white")
+    draw.text((62, 105), f"{exchange}  •  5m execution chart  •  {result.get('direction', 'SIGNAL')}", font=body_font, fill="#dddddd")
+
+    for i in range(6):
+        gy = top + i * (bottom - top) / 5
+        price = hi - i * (hi - lo) / 5
+        draw.line((left, gy, right, gy), fill="#2a2d33", width=1)
+        draw.text((right + 10, gy - 12), _fmt_price(price), font=small_font, fill="#aaaaaa")
+
+    step = (right - left) / max(len(candles), 1)
+    body_w = max(5, int(step * 0.62))
+    for i, c in enumerate(candles):
+        x = left + (i + 0.5) * step
+        yo, yc = y(float(c["open"])), y(float(c["close"]))
+        yh, yl = y(float(c["high"])), y(float(c["low"]))
+        up = float(c["close"]) >= float(c["open"])
+        fill = "#35d07f" if up else "#ff5d73"
+        draw.line((x, yh, x, yl), fill=fill, width=2)
+        draw.rectangle((x - body_w / 2, min(yo, yc), x + body_w / 2, max(yo, yc) + 1), fill=fill)
+
+    zone = result.get("entry_zone") or {}
+    levels = [
+        (zone.get("low"), "ENTRY LOW", "#ffd166"),
+        (zone.get("high"), "ENTRY HIGH", "#ffd166"),
+        (result.get("stop_loss"), "SL", "#ff5d73"),
+        (result.get("take_profit_1"), "TP1", "#35d07f"),
+        (result.get("take_profit_2"), "TP2", "#35d07f"),
+    ]
+    for value, label, fill in levels:
+        if value is None:
+            continue
+        price = float(value)
+        if lo <= price <= hi:
+            yy = y(price)
+            draw.line((left, yy, right, yy), fill=fill, width=3)
+            draw.rectangle((left + 8, yy - 18, left + 145, yy + 18), fill="#101114")
+            draw.text((left + 15, yy - 13), f"{label} {_fmt_price(price)}", font=small_font, fill=fill)
+
+    live = result.get("live_price")
+    if live is not None and lo <= float(live) <= hi:
+        yy = y(float(live))
+        draw.line((left, yy, right, yy), fill="#ffffff", width=2)
+        draw.text((right - 190, yy - 28), f"LIVE {_fmt_price(live)}", font=small_font, fill="white")
+
+    score = result.get("score", 0)
+    action = result.get("action", "WAIT")
+    draw.text((60, 735), f"Score: {score}/100   •   Action: {action}   •   Advanced multi-timeframe SMC", font=body_font, fill="white")
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
 async def _send_telegram(text: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -147,6 +225,24 @@ async def _send_telegram(text: str) -> bool:
         return False
 
 
+async def _send_telegram_photo(text: str, image_bytes: bytes) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not TELEGRAM_ALERTS_ENABLED or not token or not chat_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": text},
+                files={"photo": ("shark_smc_signal.png", image_bytes, "image/png")},
+            )
+            data = response.json()
+        return bool(response.is_success and data.get("ok") is True)
+    except Exception:
+        return False
+
+
 async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> bool:
     if result.get("setup") != "VALID" or result.get("direction") not in {"LONG", "SHORT"}:
         return False
@@ -155,6 +251,7 @@ async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> boo
     key = "|".join([exchange, pair, str(result.get("direction")), str(zone.get("low")), str(zone.get("high")), str(result.get("stop_loss")), str(result.get("take_profit_1")), str(result.get("take_profit_2"))])
     if key in _telegram_alert_keys:
         return False
+
     message = (
         f"🦈 SHARK {pair} SMC — CONFIRMED SIGNAL\n\n"
         f"Exchange: {exchange}\nPair: {pair} Perpetual\nDirection: {result['direction']}\n"
@@ -162,9 +259,18 @@ async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> boo
         f"Entry zone: {_fmt_price(zone.get('low'))} – {_fmt_price(zone.get('high'))}\n"
         f"Stop loss: {_fmt_price(result.get('stop_loss'))}\nTP1: {_fmt_price(result.get('take_profit_1'))}\nTP2: {_fmt_price(result.get('take_profit_2'))}\n"
         f"Live price: {_fmt_price(result.get('live_price'))}\n\n"
-        "Advanced SMC confluence confirmed."
+        "Advanced SMC confluence confirmed. Chart attached."
     )
-    sent = await _send_telegram(message)
+
+    chart_exchange = "BINANCE" if exchange == "BINANCE+BYBIT" else exchange
+    try:
+        candles = await fetch_klines(chart_exchange, pair, "5m", 120)
+        image_bytes = _make_signal_chart(pair, exchange, result, candles)
+        sent = await _send_telegram_photo(message, image_bytes)
+    except Exception:
+        # If chart rendering fails, still send the text alert rather than losing a valid signal.
+        sent = await _send_telegram(message)
+
     if sent:
         _telegram_alert_keys.add(key)
     return sent
@@ -227,7 +333,7 @@ async def _continuous_scanner() -> None:
                 b, y = results
                 if isinstance(b, Exception) or isinstance(y, Exception):
                     continue
-                # Telegram alert requires the same professional setup on BOTH exchanges.
+                # Send only a confirmed professional setup when both exchanges agree.
                 if b.get("setup") == "VALID" and y.get("setup") == "VALID" and b.get("direction") == y.get("direction"):
                     consensus = dict(b)
                     consensus["pair"] = pair

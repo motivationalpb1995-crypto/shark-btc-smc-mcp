@@ -16,8 +16,27 @@ DEFAULT_PAIR = "BTCUSDT"
 CONTRACT_TYPE = "PERPETUAL"
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
 EXCHANGES = {"BINANCE", "BYBIT"}
-BINANCE_BASE_URL = os.getenv("BINANCE_FAPI_URL", "https://fapi.binance.com")
-BYBIT_BASE_URL = os.getenv("BYBIT_V5_URL", "https://api.bybit.com")
+
+# Public futures endpoints with failover. A Render instance can occasionally
+# reach one exchange hostname while another hostname is blocked/rate-limited.
+BINANCE_BASE_URLS = [
+    x.strip().rstrip("/") for x in os.getenv(
+        "BINANCE_FAPI_URLS",
+        "https://fapi.binance.com,https://fapi1.binance.com,https://fapi2.binance.com,https://fapi3.binance.com,https://fapi4.binance.com",
+    ).split(",") if x.strip()
+]
+BYBIT_BASE_URLS = [
+    x.strip().rstrip("/") for x in os.getenv(
+        "BYBIT_V5_URLS",
+        "https://api.bybit.com,https://api.bytick.com,https://api.bybit.eu,https://api.bybit.ae,https://api.bybit.id",
+    ).split(",") if x.strip()
+]
+
+# Keep the old single-URL environment variables compatible.
+if os.getenv("BINANCE_FAPI_URL"):
+    BINANCE_BASE_URLS = [os.getenv("BINANCE_FAPI_URL", "").rstrip("/")] + [x for x in BINANCE_BASE_URLS if x != os.getenv("BINANCE_FAPI_URL", "").rstrip("/")]
+if os.getenv("BYBIT_V5_URL"):
+    BYBIT_BASE_URLS = [os.getenv("BYBIT_V5_URL", "").rstrip("/")] + [x for x in BYBIT_BASE_URLS if x != os.getenv("BYBIT_V5_URL", "").rstrip("/")]
 
 
 def _validate_pair(pair: str) -> str:
@@ -36,6 +55,16 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
     return data
 
 
+async def _get_json_failover(client: httpx.AsyncClient, urls: list[str], path: str, params: dict[str, Any]) -> dict:
+    errors: list[str] = []
+    for base_url in urls:
+        try:
+            return await _get_json(client, f"{base_url}{path}", params)
+        except Exception as exc:
+            errors.append(f"{base_url}: {exc}")
+    raise RuntimeError("All public exchange endpoints failed: " + " | ".join(errors))
+
+
 async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300) -> list[dict]:
     exchange = exchange.upper()
     symbol = _validate_pair(pair)
@@ -46,13 +75,23 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
 
     limit = min(max(int(limit), 50), 1000)
     bybit_interval = {"5m": "5", "15m": "15", "1h": "60", "4h": "240"}[interval]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SharkBTC-SMC/1.0)",
+        "Accept": "application/json",
+    }
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
-            data = await _get_json(client, f"{BINANCE_BASE_URL}/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+            data = await _get_json_failover(
+                client, BINANCE_BASE_URLS, "/fapi/v1/klines",
+                {"symbol": symbol, "interval": interval, "limit": limit},
+            )
             rows = data
         else:
-            data = await _get_json(client, f"{BYBIT_BASE_URL}/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit})
+            data = await _get_json_failover(
+                client, BYBIT_BASE_URLS, "/v5/market/kline",
+                {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit},
+            )
             if data.get("retCode") not in (None, 0):
                 raise ValueError(f"Bybit error: {data.get('retMsg')}")
             rows = data.get("result", {}).get("list", [])
@@ -78,11 +117,15 @@ async def fetch_live_price(exchange: str, pair: str) -> float:
     symbol = _validate_pair(pair)
     if exchange not in EXCHANGES:
         raise ValueError("Exchange must be BINANCE or BYBIT")
-    async with httpx.AsyncClient(timeout=10) as client:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SharkBTC-SMC/1.0)",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
-            data = await _get_json(client, f"{BINANCE_BASE_URL}/fapi/v1/ticker/price", {"symbol": symbol})
+            data = await _get_json_failover(client, BINANCE_BASE_URLS, "/fapi/v1/ticker/price", {"symbol": symbol})
             return float(data["price"])
-        data = await _get_json(client, f"{BYBIT_BASE_URL}/v5/market/tickers", {"category": "linear", "symbol": symbol})
+        data = await _get_json_failover(client, BYBIT_BASE_URLS, "/v5/market/tickers", {"category": "linear", "symbol": symbol})
         return float(data["result"]["list"][0]["lastPrice"])
 
 
@@ -101,7 +144,7 @@ async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
 def _normalize_exchange(value: str | None) -> str:
     """Normalize browser-friendly exchange values to BINANCE, BYBIT, or BOTH."""
     raw = (value or "BOTH").strip().upper()
-    compact = raw.replace(" ", "")
+    compact = raw.replace(" ", "").replace("%20", "")
     if compact in {"", "BOTH", "BINANCE+BYBIT", "BYBIT+BINANCE", "BINANCE,BYBIT", "BYBIT,BINANCE", "BINANCEBYBIT", "BYBITBINANCE"}:
         return "BOTH"
     return raw
@@ -157,11 +200,11 @@ async def get_btcusdt_perpetual_market_data(exchange: str = "BOTH", pair: str = 
         )
         return {"exchange": ex, "pair": symbol, "contract_type": CONTRACT_TYPE, "live_price": live, "4h": h4, "1h": h1, "15m": m15, "5m": m5}
 
-    if exchange.upper() == "BOTH":
+    if _normalize_exchange(exchange) == "BOTH":
         import asyncio
         b, y = await asyncio.gather(one("BINANCE"), one("BYBIT"))
         return {"BINANCE": b, "BYBIT": y}
-    return await one(exchange.upper())
+    return await one(_normalize_exchange(exchange))
 
 
 async def health(request):

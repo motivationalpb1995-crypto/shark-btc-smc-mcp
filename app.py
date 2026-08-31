@@ -4,481 +4,270 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
-mcp = FastMCP("Shark BTC SMC")
+mcp = FastMCP("BTC SMC Multi-Exchange")
 
-BASE_URL = os.getenv(
-    "SHARK_BASE_URL",
-    "https://api.sharkexchange.in"
-)
-
-DEFAULT_PAIR = os.getenv(
-    "SHARK_PAIR",
-    "BTCUSDT"
-)
-
+DEFAULT_PAIR = os.getenv("DEFAULT_PAIR", "BTCUSDT")
+BINANCE_URL = os.getenv("BINANCE_URL", "https://api.binance.com")
+BYBIT_URL = os.getenv("BYBIT_URL", "https://api.bybit.com")
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
 
 
-# ---------------------------------------------------------
-# SHARK MARKET DATA
-# ---------------------------------------------------------
+async def _get(url: str, params: dict[str, Any]) -> Any:
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
 
-async def fetch_klines(
-    pair: str,
-    interval: str,
-    limit: int = 200,
-    price_type: str = "MARK_PRICE"
-) -> list[dict]:
 
-    if interval not in VALID_INTERVALS:
-        raise ValueError(
-            "Interval must be one of: 5m, 15m, 1h, 4h"
-        )
-
-    limit = min(max(int(limit), 20), 1000)
-
-    payload = {
-        "pair": pair or DEFAULT_PAIR,
-        "interval": interval,
-        "limit": limit
+def _normalize_candle(c: list[Any]) -> dict:
+    return {
+        "time": int(c[0]),
+        "open": float(c[1]),
+        "high": float(c[2]),
+        "low": float(c[3]),
+        "close": float(c[4]),
+        "volume": float(c[5]),
+        "endTime": int(c[6]) if len(c) > 6 else None,
     }
 
-    url = f"{BASE_URL}/v1/market/klines?priceType={price_type}"
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-
-        response.raise_for_status()
-        data = response.json()
-
-    # Shark normally returns a list.
-    # Handle wrapped responses too.
-    if isinstance(data, dict):
-        for key in ("data", "result", "rows", "klines"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-
+async def fetch_binance_klines(pair: str, interval: str, limit: int = 200) -> list[dict]:
+    if interval not in VALID_INTERVALS:
+        raise ValueError("Interval must be one of: 5m, 15m, 1h, 4h")
+    limit = min(max(int(limit), 20), 1000)
+    data = await _get(
+        f"{BINANCE_URL}/api/v3/klines",
+        {"symbol": (pair or DEFAULT_PAIR).upper(), "interval": interval, "limit": limit},
+    )
     if not isinstance(data, list):
-        raise ValueError(f"Unexpected Shark kline response: {data}")
+        raise ValueError(f"Unexpected Binance response: {data}")
+    return sorted([_normalize_candle(c) for c in data if isinstance(c, list) and len(c) >= 6], key=lambda x: x["time"])
 
+
+async def fetch_bybit_klines(pair: str, interval: str, limit: int = 200) -> list[dict]:
+    if interval not in VALID_INTERVALS:
+        raise ValueError("Interval must be one of: 5m, 15m, 1h, 4h")
+    limit = min(max(int(limit), 20), 1000)
+    interval_map = {"5m": "5", "15m": "15", "1h": "60", "4h": "240"}
+    data = await _get(
+        f"{BYBIT_URL}/v5/market/kline",
+        {
+            "category": "linear",
+            "symbol": (pair or DEFAULT_PAIR).upper(),
+            "interval": interval_map[interval],
+            "limit": limit,
+        },
+    )
+    if not isinstance(data, dict) or data.get("retCode") != 0:
+        raise ValueError(f"Unexpected Bybit response: {data}")
+    rows = data.get("result", {}).get("list", [])
     candles = []
-
-    for c in data:
-        if not isinstance(c, dict):
+    for c in rows:
+        if not isinstance(c, list) or len(c) < 6:
             continue
-
-        try:
-            candles.append({
-                "time": int(c["startTime"]),
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-                "endTime": int(c["endTime"]),
-                "volume": float(c.get("volume", 0))
-            })
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    if len(candles) < 20:
-        raise ValueError(
-            f"Not enough valid candles returned for {pair} {interval}"
-        )
-
+        candles.append({
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+            "endTime": None,
+        })
     candles.sort(key=lambda x: x["time"])
-
     return candles
 
 
-# ---------------------------------------------------------
-# BASIC MARKET TOOLS
-# ---------------------------------------------------------
-
-@mcp.tool
-async def get_btc_4h(limit: int = 200) -> dict:
-    """Read Shark BTC 4-hour candles for higher-timeframe bias."""
-    return {
-        "pair": DEFAULT_PAIR,
-        "interval": "4h",
-        "candles": await fetch_klines(DEFAULT_PAIR, "4h", limit)
-    }
-
-
-@mcp.tool
-async def get_btc_1h(limit: int = 200) -> dict:
-    """Read Shark BTC 1-hour candles for BOS/CHOCH and liquidity."""
-    return {
-        "pair": DEFAULT_PAIR,
-        "interval": "1h",
-        "candles": await fetch_klines(DEFAULT_PAIR, "1h", limit)
-    }
+async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 200) -> list[dict]:
+    exchange = exchange.lower()
+    if exchange == "binance":
+        candles = await fetch_binance_klines(pair, interval, limit)
+    elif exchange == "bybit":
+        candles = await fetch_bybit_klines(pair, interval, limit)
+    else:
+        raise ValueError("Exchange must be 'binance' or 'bybit'")
+    if len(candles) < 20:
+        raise ValueError(f"Not enough valid candles returned for {exchange} {pair} {interval}")
+    return candles
 
 
 @mcp.tool
-async def get_btc_15m(limit: int = 200) -> dict:
-    """Read Shark BTC 15-minute candles for POI and setup context."""
-    return {
-        "pair": DEFAULT_PAIR,
-        "interval": "15m",
-        "candles": await fetch_klines(DEFAULT_PAIR, "15m", limit)
-    }
+async def get_binance_btc_4h(limit: int = 200) -> dict:
+    return {"exchange": "binance", "pair": DEFAULT_PAIR, "interval": "4h", "candles": await fetch_klines("binance", DEFAULT_PAIR, "4h", limit)}
 
 
 @mcp.tool
-async def get_btc_5m(limit: int = 200) -> dict:
-    """Read Shark BTC 5-minute candles for MSS/displacement/entry."""
-    return {
-        "pair": DEFAULT_PAIR,
-        "interval": "5m",
-        "candles": await fetch_klines(DEFAULT_PAIR, "5m", limit)
-    }
+async def get_binance_btc_1h(limit: int = 200) -> dict:
+    return {"exchange": "binance", "pair": DEFAULT_PAIR, "interval": "1h", "candles": await fetch_klines("binance", DEFAULT_PAIR, "1h", limit)}
 
 
-# ---------------------------------------------------------
-# SMC HELPERS
-# ---------------------------------------------------------
+@mcp.tool
+async def get_binance_btc_15m(limit: int = 200) -> dict:
+    return {"exchange": "binance", "pair": DEFAULT_PAIR, "interval": "15m", "candles": await fetch_klines("binance", DEFAULT_PAIR, "15m", limit)}
 
-def body(c):
+
+@mcp.tool
+async def get_binance_btc_5m(limit: int = 200) -> dict:
+    return {"exchange": "binance", "pair": DEFAULT_PAIR, "interval": "5m", "candles": await fetch_klines("binance", DEFAULT_PAIR, "5m", limit)}
+
+
+@mcp.tool
+async def get_bybit_btc_4h(limit: int = 200) -> dict:
+    return {"exchange": "bybit", "pair": DEFAULT_PAIR, "interval": "4h", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "4h", limit)}
+
+
+@mcp.tool
+async def get_bybit_btc_1h(limit: int = 200) -> dict:
+    return {"exchange": "bybit", "pair": DEFAULT_PAIR, "interval": "1h", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "1h", limit)}
+
+
+@mcp.tool
+async def get_bybit_btc_15m(limit: int = 200) -> dict:
+    return {"exchange": "bybit", "pair": DEFAULT_PAIR, "interval": "15m", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "15m", limit)}
+
+
+@mcp.tool
+async def get_bybit_btc_5m(limit: int = 200) -> dict:
+    return {"exchange": "bybit", "pair": DEFAULT_PAIR, "interval": "5m", "candles": await fetch_klines("bybit", DEFAULT_PAIR, "5m", limit)}
+
+
+def body(c: dict) -> float:
     return abs(c["close"] - c["open"])
 
 
-def bullish(c):
-    return c["close"] > c["open"]
+def recent_high(candles: list[dict], lookback: int = 20) -> float:
+    return max(c["high"] for c in candles[-lookback:])
 
 
-def bearish(c):
-    return c["close"] < c["open"]
+def recent_low(candles: list[dict], lookback: int = 20) -> float:
+    return min(c["low"] for c in candles[-lookback:])
 
 
-def recent_high(candles, lookback=20):
-    data = candles[-lookback:]
-    return max(c["high"] for c in data)
-
-
-def recent_low(candles, lookback=20):
-    data = candles[-lookback:]
-    return min(c["low"] for c in data)
-
-
-def detect_structure(candles, lookback=20):
-    """
-    Simple structure model:
-    - close above previous range high => bullish BOS
-    - close below previous range low => bearish BOS
-    """
-
+def detect_structure(candles: list[dict], lookback: int = 20) -> dict:
     if len(candles) < lookback + 2:
-        return {
-            "structure": "UNKNOWN",
-            "bos": False
-        }
-
+        return {"structure": "UNKNOWN", "bos": False}
     current = candles[-1]
     previous = candles[-lookback-1:-1]
-
     previous_high = max(c["high"] for c in previous)
     previous_low = min(c["low"] for c in previous)
-
     if current["close"] > previous_high:
-        return {
-            "structure": "BULLISH",
-            "bos": True,
-            "level": previous_high
-        }
-
+        return {"structure": "BULLISH", "bos": True, "level": previous_high}
     if current["close"] < previous_low:
-        return {
-            "structure": "BEARISH",
-            "bos": True,
-            "level": previous_low
-        }
-
-    return {
-        "structure": "RANGE",
-        "bos": False,
-        "high": previous_high,
-        "low": previous_low
-    }
+        return {"structure": "BEARISH", "bos": True, "level": previous_low}
+    return {"structure": "RANGE", "bos": False, "high": previous_high, "low": previous_low}
 
 
-def detect_fvg(candles):
-    """
-    Three-candle fair value gap.
-    Bullish FVG:
-        candle1.high < candle3.low
-    Bearish FVG:
-        candle1.low > candle3.high
-    """
-
+def detect_fvg(candles: list[dict]) -> dict | None:
     if len(candles) < 3:
         return None
-
-    a = candles[-3]
-    b = candles[-2]
-    c = candles[-1]
-
+    a, _, c = candles[-3], candles[-2], candles[-1]
     if a["high"] < c["low"]:
-        return {
-            "type": "BULLISH",
-            "low": a["high"],
-            "high": c["low"]
-        }
-
+        return {"type": "BULLISH", "low": a["high"], "high": c["low"]}
     if a["low"] > c["high"]:
-        return {
-            "type": "BEARISH",
-            "low": c["high"],
-            "high": a["low"]
-        }
-
+        return {"type": "BEARISH", "low": c["high"], "high": a["low"]}
     return None
 
 
-def detect_mss(candles, lookback=8):
-    """
-    Simple short-term market structure shift.
-    """
-
+def detect_mss(candles: list[dict], lookback: int = 8) -> str:
     if len(candles) < lookback + 3:
         return "NONE"
-
     recent = candles[-lookback-1:-1]
     current = candles[-1]
-
     high = max(c["high"] for c in recent)
     low = min(c["low"] for c in recent)
-
     if current["close"] > high:
         return "BULLISH_MSS"
-
     if current["close"] < low:
         return "BEARISH_MSS"
-
     return "NONE"
 
 
-def detect_displacement(candles):
+def detect_displacement(candles: list[dict]) -> bool:
     if len(candles) < 10:
         return False
-
-    current = candles[-1]
-
-    recent_bodies = [
-        body(c) for c in candles[-10:-1]
-    ]
-
-    average_body = sum(recent_bodies) / len(recent_bodies)
-
-    return body(current) >= average_body * 1.5
+    average_body = sum(body(c) for c in candles[-10:-1]) / 9
+    return body(candles[-1]) >= average_body * 1.5
 
 
-# ---------------------------------------------------------
-# FULL SMC ANALYSIS
-# ---------------------------------------------------------
-
-@mcp.tool
-async def get_btc_smc_analysis() -> dict:
-    """
-    Full BTC multi-timeframe SMC analysis:
-    4H bias -> 1H structure -> 15M POI/FVG -> 5M MSS.
-    """
-
-    h4 = await fetch_klines(DEFAULT_PAIR, "4h", 200)
-    h1 = await fetch_klines(DEFAULT_PAIR, "1h", 200)
-    m15 = await fetch_klines(DEFAULT_PAIR, "15m", 200)
-    m5 = await fetch_klines(DEFAULT_PAIR, "5m", 200)
-
-    h4_structure = detect_structure(h4)
-    h1_structure = detect_structure(h1)
-    m15_structure = detect_structure(m15)
-
-    m15_fvg = detect_fvg(m15)
-    m5_fvg = detect_fvg(m5)
-
-    m5_mss = detect_mss(m5)
-    displacement = detect_displacement(m5)
-
+async def analyze_exchange(exchange: str) -> dict:
+    h4, h1, m15, m5 = await __import__("asyncio").gather(
+        fetch_klines(exchange, DEFAULT_PAIR, "4h", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "1h", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "15m", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "5m", 200),
+    )
+    h4s, h1s, m15s = detect_structure(h4), detect_structure(h1), detect_structure(m15)
+    m15_fvg, m5_fvg = detect_fvg(m15), detect_fvg(m5)
+    m5_mss, displacement = detect_mss(m5), detect_displacement(m5)
     price = m5[-1]["close"]
-
-    # -----------------------------------------------------
-    # HIGHER TIMEFRAME BIAS
-    # -----------------------------------------------------
-
-    if h4_structure["structure"] == "BULLISH":
-        bias = "BULLISH"
-    elif h4_structure["structure"] == "BEARISH":
-        bias = "BEARISH"
-    else:
-        # fallback to 1H
-        if h1_structure["structure"] == "BULLISH":
-            bias = "BULLISH"
-        elif h1_structure["structure"] == "BEARISH":
-            bias = "BEARISH"
-        else:
-            bias = "NEUTRAL"
-
-    # -----------------------------------------------------
-    # SETUP VALIDATION
-    # -----------------------------------------------------
-
-    setup = "WAIT"
-    direction = "NONE"
-
+    bias = h4s["structure"] if h4s["structure"] in {"BULLISH", "BEARISH"} else h1s["structure"] if h1s["structure"] in {"BULLISH", "BEARISH"} else "NEUTRAL"
+    setup, direction = "WAIT", "NONE"
     if bias == "BULLISH":
         direction = "LONG"
-
-        if (
-            h1_structure["structure"] == "BULLISH"
-            and m5_mss == "BULLISH_MSS"
-            and displacement
-        ):
+        if h1s["structure"] == "BULLISH" and m5_mss == "BULLISH_MSS" and displacement:
             setup = "VALID_LONG"
-
     elif bias == "BEARISH":
         direction = "SHORT"
-
-        if (
-            h1_structure["structure"] == "BEARISH"
-            and m5_mss == "BEARISH_MSS"
-            and displacement
-        ):
+        if h1s["structure"] == "BEARISH" and m5_mss == "BEARISH_MSS" and displacement:
             setup = "VALID_SHORT"
-
-    # -----------------------------------------------------
-    # ENTRY / SL / TP
-    # -----------------------------------------------------
-
     entry = price
-    sl = None
-    tp1 = None
-    tp2 = None
+    sl = tp1 = tp2 = None
     rr = None
-
     if setup == "VALID_LONG":
-
-        swing_low = recent_low(m5, 20)
-
-        sl = swing_low
-
+        sl = recent_low(m5, 20)
         risk = entry - sl
-
         if risk > 0:
-            tp1 = entry + risk * 2
-            tp2 = entry + risk * 3
-
-            rr = {
-                "TP1": 2.0,
-                "TP2": 3.0
-            }
-
+            tp1, tp2, rr = entry + risk * 2, entry + risk * 3, {"TP1": 2.0, "TP2": 3.0}
     elif setup == "VALID_SHORT":
-
-        swing_high = recent_high(m5, 20)
-
-        sl = swing_high
-
+        sl = recent_high(m5, 20)
         risk = sl - entry
-
         if risk > 0:
-            tp1 = entry - risk * 2
-            tp2 = entry - risk * 3
-
-            rr = {
-                "TP1": 2.0,
-                "TP2": 3.0
-            }
-
-    # -----------------------------------------------------
-    # POI
-    # -----------------------------------------------------
-
-    poi = None
-
-    if m15_fvg:
-        poi = m15_fvg
-
-    elif m5_fvg:
-        poi = m5_fvg
-
-    # -----------------------------------------------------
-    # FINAL RESULT
-    # -----------------------------------------------------
-
+            tp1, tp2, rr = entry - risk * 2, entry - risk * 3, {"TP1": 2.0, "TP2": 3.0}
     return {
-        "pair": DEFAULT_PAIR,
-
-        "current_price": price,
-
-        "bias": bias,
-        "direction": direction,
-        "setup": setup,
-
-        "4H": {
-            "structure": h4_structure
-        },
-
-        "1H": {
-            "structure": h1_structure
-        },
-
-        "15M": {
-            "structure": m15_structure,
-            "FVG": m15_fvg
-        },
-
-        "5M": {
-            "MSS": m5_mss,
-            "displacement": displacement,
-            "FVG": m5_fvg
-        },
-
-        "POI": poi,
-
-        "entry": entry,
-        "stop_loss": sl,
-        "take_profit_1": tp1,
-        "take_profit_2": tp2,
-        "risk_reward": rr,
-
-        "trade_action": (
-            "WAIT FOR CONFIRMATION"
-            if setup == "WAIT"
-            else "SMC SETUP DETECTED - MANUAL REVIEW REQUIRED"
-        )
+        "exchange": exchange, "pair": DEFAULT_PAIR, "current_price": price,
+        "bias": bias, "direction": direction, "setup": setup,
+        "4H": {"structure": h4s}, "1H": {"structure": h1s},
+        "15M": {"structure": m15s, "FVG": m15_fvg},
+        "5M": {"MSS": m5_mss, "displacement": displacement, "FVG": m5_fvg},
+        "POI": m15_fvg or m5_fvg, "entry": entry, "stop_loss": sl,
+        "take_profit_1": tp1, "take_profit_2": tp2, "risk_reward": rr,
+        "trade_action": "WAIT FOR CONFIRMATION" if setup == "WAIT" else "SMC SETUP DETECTED - MANUAL REVIEW REQUIRED",
     }
 
-
-# ---------------------------------------------------------
-# RAW MULTI-TIMEFRAME DATA
-# ---------------------------------------------------------
 
 @mcp.tool
-async def get_btc_smc_data() -> dict:
-    """Return 4H, 1H, 15M and 5M Shark candles."""
-
-    return {
-        "pair": DEFAULT_PAIR,
-        "4h": await fetch_klines(DEFAULT_PAIR, "4h", 200),
-        "1h": await fetch_klines(DEFAULT_PAIR, "1h", 200),
-        "15m": await fetch_klines(DEFAULT_PAIR, "15m", 200),
-        "5m": await fetch_klines(DEFAULT_PAIR, "5m", 200)
-    }
+async def get_btc_smc_analysis(exchange: str = "binance") -> dict:
+    """Multi-timeframe BTC SMC analysis using Binance or Bybit public market data."""
+    if exchange.lower() not in {"binance", "bybit"}:
+        raise ValueError("Exchange must be 'binance' or 'bybit'")
+    return await analyze_exchange(exchange.lower())
 
 
-# ---------------------------------------------------------
-# SERVER
-# ---------------------------------------------------------
+@mcp.tool
+async def get_btc_smc_comparison() -> dict:
+    """Compare BTC SMC state across Binance and Bybit using public data."""
+    import asyncio
+    binance, bybit = await asyncio.gather(analyze_exchange("binance"), analyze_exchange("bybit"))
+    agreement = binance["bias"] == bybit["bias"] and binance["direction"] == bybit["direction"]
+    return {"pair": DEFAULT_PAIR, "binance": binance, "bybit": bybit, "exchange_agreement": agreement}
+
+
+@mcp.tool
+async def get_btc_market_data(exchange: str = "binance") -> dict:
+    """Return BTC 4H, 1H, 15M and 5M candles from Binance or Bybit."""
+    import asyncio
+    exchange = exchange.lower()
+    if exchange not in {"binance", "bybit"}:
+        raise ValueError("Exchange must be 'binance' or 'bybit'")
+    h4, h1, m15, m5 = await asyncio.gather(
+        fetch_klines(exchange, DEFAULT_PAIR, "4h", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "1h", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "15m", 200),
+        fetch_klines(exchange, DEFAULT_PAIR, "5m", 200),
+    )
+    return {"exchange": exchange, "pair": DEFAULT_PAIR, "4h": h4, "1h": h1, "15m": m15, "5m": m5}
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-
-    mcp.run(
-        transport="sse",
-        host="0.0.0.0",
-        port=port
-    )
+    mcp.run(transport="sse", host="0.0.0.0", port=port)

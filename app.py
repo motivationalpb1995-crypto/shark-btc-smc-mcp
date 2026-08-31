@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import httpx
 from fastmcp import FastMCP
@@ -17,8 +18,6 @@ CONTRACT_TYPE = "PERPETUAL"
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
 EXCHANGES = {"BINANCE", "BYBIT"}
 
-# Public futures endpoints with failover. A Render instance can occasionally
-# reach one exchange hostname while another hostname is blocked/rate-limited.
 BINANCE_BASE_URLS = [
     x.strip().rstrip("/") for x in os.getenv(
         "BINANCE_FAPI_URLS",
@@ -28,15 +27,26 @@ BINANCE_BASE_URLS = [
 BYBIT_BASE_URLS = [
     x.strip().rstrip("/") for x in os.getenv(
         "BYBIT_V5_URLS",
-        "https://api.bybit.com,https://api.bytick.com,https://api.bybit.eu,https://api.bybit.ae,https://api.bybit.id",
+        "https://api.bybit.com,https://api.bytick.com,https://api.bybit.eu,https://api.bybit.ae,https://api.bybit.id,https://api.bybit.kz,https://api.bybit-tr.com,https://api.byhkbit.com,https://api.bybitgeorgia.ge",
     ).split(",") if x.strip()
 ]
 
-# Keep the old single-URL environment variables compatible.
+# Render/free cloud IPs can be geo-blocked by exchange APIs. These public
+# read-only relays are only used after every direct exchange endpoint fails.
+# Override with MARKET_PROXY_URLS if a private/managed relay is preferred.
+MARKET_PROXY_URLS = [
+    x.strip() for x in os.getenv(
+        "MARKET_PROXY_URLS",
+        "https://api.allorigins.win/raw?url={url},https://corsproxy.io/?url={url}",
+    ).split(",") if x.strip()
+]
+
 if os.getenv("BINANCE_FAPI_URL"):
-    BINANCE_BASE_URLS = [os.getenv("BINANCE_FAPI_URL", "").rstrip("/")] + [x for x in BINANCE_BASE_URLS if x != os.getenv("BINANCE_FAPI_URL", "").rstrip("/")]
+    chosen = os.getenv("BINANCE_FAPI_URL", "").rstrip("/")
+    BINANCE_BASE_URLS = [chosen] + [x for x in BINANCE_BASE_URLS if x != chosen]
 if os.getenv("BYBIT_V5_URL"):
-    BYBIT_BASE_URLS = [os.getenv("BYBIT_V5_URL", "").rstrip("/")] + [x for x in BYBIT_BASE_URLS if x != os.getenv("BYBIT_V5_URL", "").rstrip("/")]
+    chosen = os.getenv("BYBIT_V5_URL", "").rstrip("/")
+    BYBIT_BASE_URLS = [chosen] + [x for x in BYBIT_BASE_URLS if x != chosen]
 
 
 def _validate_pair(pair: str) -> str:
@@ -55,14 +65,42 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
     return data
 
 
-async def _get_json_failover(client: httpx.AsyncClient, urls: list[str], path: str, params: dict[str, Any]) -> dict:
+async def _get_json_failover(
+    client: httpx.AsyncClient,
+    urls: list[str],
+    path: str,
+    params: dict[str, Any],
+) -> dict:
     errors: list[str] = []
+
+    # 1) Try official exchange endpoints directly.
     for base_url in urls:
         try:
             return await _get_json(client, f"{base_url}{path}", params)
         except Exception as exc:
             errors.append(f"{base_url}: {exc}")
-    raise RuntimeError("All public exchange endpoints failed: " + " | ".join(errors))
+
+    # 2) If Render's egress IP is blocked/geo-restricted, retry through a
+    # read-only HTTP relay. The exchange URL and query are preserved exactly.
+    query = urlencode(params)
+    for base_url in urls:
+        target = f"{base_url}{path}?{query}"
+        encoded_target = quote(target, safe="")
+        for template in MARKET_PROXY_URLS:
+            try:
+                if "{url}" not in template:
+                    continue
+                proxy_url = template.replace("{url}", encoded_target)
+                response = await client.get(proxy_url)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("relay returned non-object JSON")
+                return data
+            except Exception as exc:
+                errors.append(f"relay {template.split('?')[0]} -> {base_url}: {exc}")
+
+    raise RuntimeError("All public exchange endpoints and read-only relays failed: " + " | ".join(errors))
 
 
 async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300) -> list[dict]:
@@ -121,7 +159,7 @@ async def fetch_live_price(exchange: str, pair: str) -> float:
         "User-Agent": "Mozilla/5.0 (compatible; SharkBTC-SMC/1.0)",
         "Accept": "application/json",
     }
-    async with httpx.AsyncClient(timeout=10, headers=headers, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
             data = await _get_json_failover(client, BINANCE_BASE_URLS, "/fapi/v1/ticker/price", {"symbol": symbol})
             return float(data["price"])
@@ -142,7 +180,6 @@ async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
 
 
 def _normalize_exchange(value: str | None) -> str:
-    """Normalize browser-friendly exchange values to BINANCE, BYBIT, or BOTH."""
     raw = (value or "BOTH").strip().upper()
     compact = raw.replace(" ", "").replace("%20", "")
     if compact in {"", "BOTH", "BINANCE+BYBIT", "BYBIT+BINANCE", "BINANCE,BYBIT", "BYBIT,BINANCE", "BINANCEBYBIT", "BYBITBINANCE"}:
@@ -202,13 +239,16 @@ async def get_btcusdt_perpetual_market_data(exchange: str = "BOTH", pair: str = 
 
     if _normalize_exchange(exchange) == "BOTH":
         import asyncio
-        b, y = await asyncio.gather(one("BINANCE"), one("BYBIT"))
-        return {"BINANCE": b, "BYBIT": y}
+        results = await asyncio.gather(one("BINANCE"), one("BYBIT"), return_exceptions=True)
+        return {
+            "BINANCE": results[0] if not isinstance(results[0], Exception) else {"error": str(results[0])},
+            "BYBIT": results[1] if not isinstance(results[1], Exception) else {"error": str(results[1])},
+        }
     return await one(_normalize_exchange(exchange))
 
 
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "Shark BTC Advanced SMC", "pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "exchanges": ["BINANCE", "BYBIT"]})
+    return JSONResponse({"status": "ok", "service": "Shark BTC Advanced SMC", "pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "exchanges": ["BINANCE", "BYBIT"], "public_api": "/api/smc?exchange=BOTH&pair=BTCUSDT"})
 
 
 async def public_smc(request):
@@ -221,7 +261,6 @@ async def public_smc(request):
         return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
 
 
-# Public read-only HTTP API. This works from a normal browser and does not require MCP.
 public_app = Starlette(routes=[
     Route("/", health, methods=["GET"]),
     Route("/health", health, methods=["GET"]),

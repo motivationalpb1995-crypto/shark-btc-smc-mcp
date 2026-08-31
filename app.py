@@ -48,6 +48,11 @@ if os.getenv("BYBIT_V5_URL"):
     chosen = os.getenv("BYBIT_V5_URL", "").rstrip("/")
     BYBIT_BASE_URLS = [chosen] + [x for x in BYBIT_BASE_URLS if x != chosen]
 
+# Telegram alerts are enabled automatically when the bot token and chat ID
+# are configured in Render. Set TELEGRAM_ALERTS_ENABLED=false to disable.
+TELEGRAM_ALERTS_ENABLED = os.getenv("TELEGRAM_ALERTS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+_telegram_alert_keys: set[str] = set()
+
 
 def _validate_pair(pair: str) -> str:
     symbol = (pair or DEFAULT_PAIR).upper().replace("/", "")
@@ -160,6 +165,69 @@ async def fetch_live_price(exchange: str, pair: str) -> float:
         return float(data["result"]["list"][0]["lastPrice"])
 
 
+def _fmt_price(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+async def _send_telegram(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not TELEGRAM_ALERTS_ENABLED or not token or not chat_id:
+        return False
+
+    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(telegram_url, json={"chat_id": chat_id, "text": text})
+            data = response.json()
+        return bool(response.is_success and data.get("ok") is True)
+    except Exception:
+        # Telegram failure must never break the market-data/SMC API response.
+        return False
+
+
+async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> bool:
+    if result.get("setup") != "VALID" or result.get("direction") not in {"LONG", "SHORT"}:
+        return False
+
+    zone = result.get("entry_zone") or {}
+    key = "|".join([
+        exchange,
+        str(result.get("direction")),
+        str(zone.get("low")),
+        str(zone.get("high")),
+        str(result.get("stop_loss")),
+        str(result.get("take_profit_1")),
+        str(result.get("take_profit_2")),
+    ])
+    if key in _telegram_alert_keys:
+        return False
+
+    message = (
+        "🦈 SHARK BTC SMC — CONFIRMED SIGNAL\n\n"
+        f"Exchange: {exchange}\n"
+        f"Pair: BTCUSDT Perpetual\n"
+        f"Direction: {result['direction']}\n"
+        f"Score: {result.get('score', 0)}/100\n"
+        f"Action: {result.get('action', 'WAIT')}\n\n"
+        f"Entry zone: {_fmt_price(zone.get('low'))} – {_fmt_price(zone.get('high'))}\n"
+        f"Stop loss: {_fmt_price(result.get('stop_loss'))}\n"
+        f"TP1: {_fmt_price(result.get('take_profit_1'))}\n"
+        f"TP2: {_fmt_price(result.get('take_profit_2'))}\n"
+        f"Live price: {_fmt_price(result.get('live_price'))}\n\n"
+        "SMC conditions confirmed across the required setup checks."
+    )
+    sent = await _send_telegram(message)
+    if sent:
+        _telegram_alert_keys.add(key)
+    return sent
+
+
 async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
     import asyncio
     symbol = _validate_pair(pair)
@@ -169,7 +237,9 @@ async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
     )
     live = await fetch_live_price(exchange, symbol)
     analysis = analyze_advanced(h4, h1, m15, m5, live)
-    return {"exchange": exchange, "pair": symbol, "contract_type": CONTRACT_TYPE, "engine": "ADVANCED_SMC", **analysis}
+    result = {"exchange": exchange, "pair": symbol, "contract_type": CONTRACT_TYPE, "engine": "ADVANCED_SMC", **analysis}
+    result["telegram_alert_sent"] = await _notify_confirmed_signal(exchange, result)
+    return result
 
 
 def _normalize_exchange(value: str | None) -> str:

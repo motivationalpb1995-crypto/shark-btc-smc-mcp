@@ -12,4 +12,4 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-exec python app.py
+exec python server.py

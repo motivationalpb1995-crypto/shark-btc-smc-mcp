@@ -33,11 +33,11 @@ BYBIT_BASE_URLS = [
 
 # Render/free cloud IPs can be geo-blocked by exchange APIs. These public
 # read-only relays are only used after every direct exchange endpoint fails.
-# Override with MARKET_PROXY_URLS if a private/managed relay is preferred.
+# Override with MARKET_PROXY_URLS for a private/managed relay.
 MARKET_PROXY_URLS = [
     x.strip() for x in os.getenv(
         "MARKET_PROXY_URLS",
-        "https://api.allorigins.win/raw?url={url},https://corsproxy.io/?url={url}",
+        "https://api.allorigins.win/raw?url={url},https://corsproxy.io/?url={url},https://api.codetabs.com/v1/proxy?quest={url}",
     ).split(",") if x.strip()
 ]
 
@@ -56,13 +56,10 @@ def _validate_pair(pair: str) -> str:
     return DEFAULT_PAIR
 
 
-async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any]) -> dict:
+async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any]) -> Any:
     response = await client.get(url, params=params)
     response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise ValueError(f"Unexpected response from {url}: {data}")
-    return data
+    return response.json()
 
 
 async def _get_json_failover(
@@ -70,7 +67,7 @@ async def _get_json_failover(
     urls: list[str],
     path: str,
     params: dict[str, Any],
-) -> dict:
+) -> Any:
     errors: list[str] = []
 
     # 1) Try official exchange endpoints directly.
@@ -78,10 +75,9 @@ async def _get_json_failover(
         try:
             return await _get_json(client, f"{base_url}{path}", params)
         except Exception as exc:
-            errors.append(f"{base_url}: {exc}")
+            errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
 
-    # 2) If Render's egress IP is blocked/geo-restricted, retry through a
-    # read-only HTTP relay. The exchange URL and query are preserved exactly.
+    # 2) Render egress can be geo-blocked. Retry through read-only relays.
     query = urlencode(params)
     for base_url in urls:
         target = f"{base_url}{path}?{query}"
@@ -93,14 +89,11 @@ async def _get_json_failover(
                 proxy_url = template.replace("{url}", encoded_target)
                 response = await client.get(proxy_url)
                 response.raise_for_status()
-                data = response.json()
-                if not isinstance(data, dict):
-                    raise ValueError("relay returned non-object JSON")
-                return data
+                return response.json()
             except Exception as exc:
-                errors.append(f"relay {template.split('?')[0]} -> {base_url}: {exc}")
+                errors.append(f"relay {template.split('?')[0]} -> {base_url}: {type(exc).__name__}: {exc}")
 
-    raise RuntimeError("All public exchange endpoints and read-only relays failed: " + " | ".join(errors))
+    raise RuntimeError("All exchange endpoints and read-only relays failed: " + " | ".join(errors))
 
 
 async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300) -> list[dict]:
@@ -120,11 +113,10 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
 
     async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
-            data = await _get_json_failover(
+            rows = await _get_json_failover(
                 client, BINANCE_BASE_URLS, "/fapi/v1/klines",
                 {"symbol": symbol, "interval": interval, "limit": limit},
             )
-            rows = data
         else:
             data = await _get_json_failover(
                 client, BYBIT_BASE_URLS, "/v5/market/kline",
@@ -134,8 +126,11 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
                 raise ValueError(f"Bybit error: {data.get('retMsg')}")
             rows = data.get("result", {}).get("list", [])
 
+    if not isinstance(rows, list):
+        raise ValueError(f"Unexpected kline response from {exchange}")
+
     candles: list[dict] = []
-    for row in rows or []:
+    for row in rows:
         try:
             if exchange == "BINANCE":
                 candles.append({"time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "endTime": int(row[6]), "volume": float(row[5])})

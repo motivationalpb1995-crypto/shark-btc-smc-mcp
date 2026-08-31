@@ -1,0 +1,20 @@
+name: Shark BTC SMC Continuous Scanner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Wake Render and run Binance + Bybit SMC scan
+        run: |
+          set -e
+          URL="https://shark-btc-smc-mcp-1.onrender.com/api/smc?exchange=BOTH&pair=BTCUSDT"
+          echo "Running Shark BTC SMC scan..."
+          curl --fail --show-error --silent --max-time 120 "$URL" | tee scan-result.json
+          echo
+          echo "Scan completed. Telegram notification is handled by the deployed service for confirmed VALID setups."

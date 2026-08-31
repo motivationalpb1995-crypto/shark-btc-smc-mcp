@@ -98,10 +98,19 @@ async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
     return {"exchange": exchange, "pair": symbol, "contract_type": CONTRACT_TYPE, "engine": "ADVANCED_SMC", **analysis}
 
 
+def _normalize_exchange(value: str | None) -> str:
+    """Normalize browser-friendly exchange values to BINANCE, BYBIT, or BOTH."""
+    raw = (value or "BOTH").strip().upper()
+    compact = raw.replace(" ", "")
+    if compact in {"", "BOTH", "BINANCE+BYBIT", "BYBIT+BINANCE", "BINANCE,BYBIT", "BYBIT,BINANCE", "BINANCEBYBIT", "BYBITBINANCE"}:
+        return "BOTH"
+    return raw
+
+
 async def _run_smc(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
     import asyncio
     symbol = _validate_pair(pair)
-    exchange = exchange.upper()
+    exchange = _normalize_exchange(exchange)
     if exchange == "BOTH":
         results = await asyncio.gather(_run_one("BINANCE", symbol), _run_one("BYBIT", symbol), return_exceptions=True)
         output: dict[str, Any] = {}
@@ -161,7 +170,7 @@ async def health(request):
 
 async def public_smc(request):
     try:
-        exchange = request.query_params.get("exchange", "BOTH").upper()
+        exchange = request.query_params.get("exchange", "BOTH")
         pair = request.query_params.get("pair", DEFAULT_PAIR)
         result = await _run_smc(exchange, pair)
         return JSONResponse(result)

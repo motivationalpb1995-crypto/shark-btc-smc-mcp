@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -11,9 +12,10 @@ import uvicorn
 
 from advanced_smc import analyze_advanced
 
-mcp = FastMCP("BTCUSDT Perpetual SMC")
+mcp = FastMCP("Shark Advanced SMC")
 
 DEFAULT_PAIR = "BTCUSDT"
+SUPPORTED_PAIRS = {"BTCUSDT", "XAUUSDT"}
 CONTRACT_TYPE = "PERPETUAL"
 VALID_INTERVALS = {"5m", "15m", "1h", "4h"}
 EXCHANGES = {"BINANCE", "BYBIT"}
@@ -30,10 +32,6 @@ BYBIT_BASE_URLS = [
         "https://api.bybit.com,https://api.bytick.com,https://api.bybit.eu,https://api.bybit.ae,https://api.bybit.id,https://api.bybit.kz,https://api.bybit-tr.com,https://api.byhkbit.com,https://api.bybitgeorgia.ge",
     ).split(",") if x.strip()
 ]
-
-# Render/free cloud IPs can be geo-blocked by exchange APIs. These public
-# read-only relays are only used after every direct exchange endpoint fails.
-# Override with MARKET_PROXY_URLS for a private/managed relay.
 MARKET_PROXY_URLS = [
     x.strip() for x in os.getenv(
         "MARKET_PROXY_URLS",
@@ -48,17 +46,15 @@ if os.getenv("BYBIT_V5_URL"):
     chosen = os.getenv("BYBIT_V5_URL", "").rstrip("/")
     BYBIT_BASE_URLS = [chosen] + [x for x in BYBIT_BASE_URLS if x != chosen]
 
-# Telegram alerts are enabled automatically when the bot token and chat ID
-# are configured in Render. Set TELEGRAM_ALERTS_ENABLED=false to disable.
 TELEGRAM_ALERTS_ENABLED = os.getenv("TELEGRAM_ALERTS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 _telegram_alert_keys: set[str] = set()
 
 
 def _validate_pair(pair: str) -> str:
-    symbol = (pair or DEFAULT_PAIR).upper().replace("/", "")
-    if symbol != DEFAULT_PAIR:
-        raise ValueError("This service is restricted to BTCUSDT perpetual only")
-    return DEFAULT_PAIR
+    symbol = (pair or DEFAULT_PAIR).upper().replace("/", "").replace("-", "")
+    if symbol not in SUPPORTED_PAIRS:
+        raise ValueError("Supported perpetual pairs: BTCUSDT, XAUUSDT")
+    return symbol
 
 
 async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any]) -> Any:
@@ -67,14 +63,8 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
     return response.json()
 
 
-async def _get_json_failover(
-    client: httpx.AsyncClient,
-    urls: list[str],
-    path: str,
-    params: dict[str, Any],
-) -> Any:
+async def _get_json_failover(client: httpx.AsyncClient, urls: list[str], path: str, params: dict[str, Any]) -> Any:
     errors: list[str] = []
-
     for base_url in urls:
         try:
             return await _get_json(client, f"{base_url}{path}", params)
@@ -89,13 +79,11 @@ async def _get_json_failover(
             try:
                 if "{url}" not in template:
                     continue
-                proxy_url = template.replace("{url}", encoded_target)
-                response = await client.get(proxy_url)
+                response = await client.get(template.replace("{url}", encoded_target))
                 response.raise_for_status()
                 return response.json()
             except Exception as exc:
                 errors.append(f"relay {template.split('?')[0]} -> {base_url}: {type(exc).__name__}: {exc}")
-
     raise RuntimeError("All exchange endpoints and read-only relays failed: " + " | ".join(errors))
 
 
@@ -109,22 +97,13 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
 
     limit = min(max(int(limit), 50), 1000)
     bybit_interval = {"5m": "5", "15m": "15", "1h": "60", "4h": "240"}[interval]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SharkBTC-SMC/1.0)",
-        "Accept": "application/json",
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SharkSMC/2.0)", "Accept": "application/json"}
 
     async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
-            rows = await _get_json_failover(
-                client, BINANCE_BASE_URLS, "/fapi/v1/klines",
-                {"symbol": symbol, "interval": interval, "limit": limit},
-            )
+            rows = await _get_json_failover(client, BINANCE_BASE_URLS, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         else:
-            data = await _get_json_failover(
-                client, BYBIT_BASE_URLS, "/v5/market/kline",
-                {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit},
-            )
+            data = await _get_json_failover(client, BYBIT_BASE_URLS, "/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit})
             if data.get("retCode") not in (None, 0):
                 raise ValueError(f"Bybit error: {data.get('retMsg')}")
             rows = data.get("result", {}).get("list", [])
@@ -151,12 +130,7 @@ async def fetch_klines(exchange: str, pair: str, interval: str, limit: int = 300
 async def fetch_live_price(exchange: str, pair: str) -> float:
     exchange = exchange.upper()
     symbol = _validate_pair(pair)
-    if exchange not in EXCHANGES:
-        raise ValueError("Exchange must be BINANCE or BYBIT")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SharkBTC-SMC/1.0)",
-        "Accept": "application/json",
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SharkSMC/2.0)", "Accept": "application/json"}
     async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
         if exchange == "BINANCE":
             data = await _get_json_failover(client, BINANCE_BASE_URLS, "/fapi/v1/ticker/price", {"symbol": symbol})
@@ -179,48 +153,32 @@ async def _send_telegram(text: str) -> bool:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not TELEGRAM_ALERTS_ENABLED or not token or not chat_id:
         return False
-
-    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(telegram_url, json={"chat_id": chat_id, "text": text})
+            response = await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text})
             data = response.json()
         return bool(response.is_success and data.get("ok") is True)
     except Exception:
-        # Telegram failure must never break the market-data/SMC API response.
         return False
 
 
 async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> bool:
     if result.get("setup") != "VALID" or result.get("direction") not in {"LONG", "SHORT"}:
         return False
-
+    pair = result.get("pair", DEFAULT_PAIR)
     zone = result.get("entry_zone") or {}
-    key = "|".join([
-        exchange,
-        str(result.get("direction")),
-        str(zone.get("low")),
-        str(zone.get("high")),
-        str(result.get("stop_loss")),
-        str(result.get("take_profit_1")),
-        str(result.get("take_profit_2")),
-    ])
+    key = "|".join([exchange, pair, str(result.get("direction")), str(zone.get("low")), str(zone.get("high")), str(result.get("stop_loss")), str(result.get("take_profit_1")), str(result.get("take_profit_2"))])
     if key in _telegram_alert_keys:
         return False
 
     message = (
-        "🦈 SHARK BTC SMC — CONFIRMED SIGNAL\n\n"
-        f"Exchange: {exchange}\n"
-        f"Pair: BTCUSDT Perpetual\n"
-        f"Direction: {result['direction']}\n"
-        f"Score: {result.get('score', 0)}/100\n"
-        f"Action: {result.get('action', 'WAIT')}\n\n"
+        f"🦈 SHARK {pair} SMC — CONFIRMED SIGNAL\n\n"
+        f"Exchange: {exchange}\nPair: {pair} Perpetual\nDirection: {result['direction']}\n"
+        f"Score: {result.get('score', 0)}/100\nAction: {result.get('action', 'WAIT')}\n\n"
         f"Entry zone: {_fmt_price(zone.get('low'))} – {_fmt_price(zone.get('high'))}\n"
-        f"Stop loss: {_fmt_price(result.get('stop_loss'))}\n"
-        f"TP1: {_fmt_price(result.get('take_profit_1'))}\n"
-        f"TP2: {_fmt_price(result.get('take_profit_2'))}\n"
+        f"Stop loss: {_fmt_price(result.get('stop_loss'))}\nTP1: {_fmt_price(result.get('take_profit_1'))}\nTP2: {_fmt_price(result.get('take_profit_2'))}\n"
         f"Live price: {_fmt_price(result.get('live_price'))}\n\n"
-        "SMC conditions confirmed across the required setup checks."
+        "Advanced SMC confluence confirmed."
     )
     sent = await _send_telegram(message)
     if sent:
@@ -228,8 +186,7 @@ async def _notify_confirmed_signal(exchange: str, result: dict[str, Any]) -> boo
     return sent
 
 
-async def _run_one(exchange: str, pair: str = DEFAULT_PAIR) -> dict:
-    import asyncio
+async def _run_one(exchange: str, pair: str) -> dict:
     symbol = _validate_pair(pair)
     h4, h1, m15, m5 = await asyncio.gather(
         fetch_klines(exchange, symbol, "4h"), fetch_klines(exchange, symbol, "1h"),
@@ -251,15 +208,12 @@ def _normalize_exchange(value: str | None) -> str:
 
 
 async def _run_smc(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
-    import asyncio
     symbol = _validate_pair(pair)
     exchange = _normalize_exchange(exchange)
     if exchange == "BOTH":
         results = await asyncio.gather(_run_one("BINANCE", symbol), _run_one("BYBIT", symbol), return_exceptions=True)
-        output: dict[str, Any] = {}
-        for name, result in zip(("BINANCE", "BYBIT"), results):
-            output[name] = {"error": str(result)} if isinstance(result, Exception) else result
-        b, y = output.get("BINANCE", {}), output.get("BYBIT", {})
+        output = {name: ({"error": str(result)} if isinstance(result, Exception) else result) for name, result in zip(("BINANCE", "BYBIT"), results)}
+        b, y = output["BINANCE"], output["BYBIT"]
         if "error" not in b and "error" not in y:
             if b.get("setup") == "VALID" and y.get("setup") == "VALID" and b.get("direction") == y.get("direction"):
                 consensus = "VALID_BOTH_EXCHANGES"
@@ -276,24 +230,26 @@ async def _run_smc(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
 
 
 @mcp.tool
+async def get_perpetual_smc_analysis(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
+    """Advanced SMC analysis for BTCUSDT or XAUUSDT perpetuals."""
+    return await _run_smc(exchange, pair)
+
+
+@mcp.tool
 async def get_btcusdt_perpetual_smc_analysis(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
-    """BTCUSDT Perpetual advanced SMC setup using Binance USD-M and/or Bybit Linear."""
-    return await _run_smc(exchange, pair)
+    return await _run_smc(exchange, "BTCUSDT")
 
 
 @mcp.tool
-async def get_btc_smc_analysis(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
-    """Compatibility alias for the BTCUSDT perpetual advanced SMC analysis."""
-    return await _run_smc(exchange, pair)
+async def get_xauusdt_perpetual_smc_analysis(exchange: str = "BOTH", pair: str = "XAUUSDT") -> dict:
+    return await _run_smc(exchange, "XAUUSDT")
 
 
 @mcp.tool
-async def get_btcusdt_perpetual_market_data(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
-    """Return normalized closed BTCUSDT perpetual candles plus live price for 4H/1H/15M/5M."""
+async def get_perpetual_market_data(exchange: str = "BOTH", pair: str = DEFAULT_PAIR) -> dict:
     symbol = _validate_pair(pair)
 
     async def one(ex: str) -> dict:
-        import asyncio
         live, h4, h1, m15, m5 = await asyncio.gather(
             fetch_live_price(ex, symbol), fetch_klines(ex, symbol, "4h"), fetch_klines(ex, symbol, "1h"),
             fetch_klines(ex, symbol, "15m"), fetch_klines(ex, symbol, "5m"),
@@ -301,57 +257,32 @@ async def get_btcusdt_perpetual_market_data(exchange: str = "BOTH", pair: str = 
         return {"exchange": ex, "pair": symbol, "contract_type": CONTRACT_TYPE, "live_price": live, "4h": h4, "1h": h1, "15m": m15, "5m": m5}
 
     if _normalize_exchange(exchange) == "BOTH":
-        import asyncio
         results = await asyncio.gather(one("BINANCE"), one("BYBIT"), return_exceptions=True)
-        return {
-            "BINANCE": results[0] if not isinstance(results[0], Exception) else {"error": str(results[0])},
-            "BYBIT": results[1] if not isinstance(results[1], Exception) else {"error": str(results[1])},
-        }
+        return {name: (r if not isinstance(r, Exception) else {"error": str(r)}) for name, r in zip(("BINANCE", "BYBIT"), results)}
     return await one(_normalize_exchange(exchange))
 
 
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "Shark BTC Advanced SMC", "pair": DEFAULT_PAIR, "contract_type": CONTRACT_TYPE, "exchanges": ["BINANCE", "BYBIT"], "public_api": "/api/smc?exchange=BOTH&pair=BTCUSDT"})
+    return JSONResponse({"status": "ok", "service": "Shark Advanced SMC", "supported_pairs": sorted(SUPPORTED_PAIRS), "contract_type": CONTRACT_TYPE, "exchanges": sorted(EXCHANGES), "public_api": "/api/smc?exchange=BOTH&pair=BTCUSDT"})
 
 
 async def public_smc(request):
     try:
-        exchange = request.query_params.get("exchange", "BOTH")
-        pair = request.query_params.get("pair", DEFAULT_PAIR)
-        result = await _run_smc(exchange, pair)
-        return JSONResponse(result)
+        return JSONResponse(await _run_smc(request.query_params.get("exchange", "BOTH"), request.query_params.get("pair", DEFAULT_PAIR)))
     except Exception as exc:
         return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
 
 
 async def test_telegram(request):
-    """Send a one-time Telegram test message using Render environment secrets."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     test_secret = os.getenv("TELEGRAM_TEST_SECRET", "").strip()
-    supplied_secret = request.query_params.get("key", "")
-
     if not token or not chat_id:
         return JSONResponse({"status": "error", "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"}, status_code=500)
-    if not test_secret:
-        return JSONResponse({"status": "error", "error": "TELEGRAM_TEST_SECRET is not configured"}, status_code=500)
-    if supplied_secret != test_secret:
+    if not test_secret or request.query_params.get("key", "") != test_secret:
         return JSONResponse({"status": "error", "error": "Unauthorized"}, status_code=401)
-
-    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": "🦈 Shark BTC SMC — Telegram test successful!\n\nBinance + Bybit connector is live.",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(telegram_url, json=payload)
-            data = response.json()
-        if response.is_success and data.get("ok") is True:
-            return JSONResponse({"status": "ok", "telegram": "message_sent"})
-        return JSONResponse({"status": "error", "error": data.get("description", "Telegram API request failed")}, status_code=502)
-    except Exception as exc:
-        return JSONResponse({"status": "error", "error": f"Telegram request failed: {type(exc).__name__}: {exc}"}, status_code=502)
+    ok = await _send_telegram("🦈 Shark SMC — Telegram test successful!\n\nBTCUSDT + XAUUSDT perpetual scanner is connected to the same bot.")
+    return JSONResponse({"status": "ok", "telegram": "message_sent"} if ok else {"status": "error", "error": "Telegram API request failed"}, status_code=200 if ok else 502)
 
 
 public_app = Starlette(routes=[

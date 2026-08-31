@@ -70,14 +70,12 @@ async def _get_json_failover(
 ) -> Any:
     errors: list[str] = []
 
-    # 1) Try official exchange endpoints directly.
     for base_url in urls:
         try:
             return await _get_json(client, f"{base_url}{path}", params)
         except Exception as exc:
             errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
 
-    # 2) Render egress can be geo-blocked. Retry through read-only relays.
     query = urlencode(params)
     for base_url in urls:
         target = f"{base_url}{path}?{query}"
@@ -256,10 +254,41 @@ async def public_smc(request):
         return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
 
 
+async def test_telegram(request):
+    """Send a one-time Telegram test message using Render environment secrets."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    test_secret = os.getenv("TELEGRAM_TEST_SECRET", "").strip()
+    supplied_secret = request.query_params.get("key", "")
+
+    if not token or not chat_id:
+        return JSONResponse({"status": "error", "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"}, status_code=500)
+    if not test_secret:
+        return JSONResponse({"status": "error", "error": "TELEGRAM_TEST_SECRET is not configured"}, status_code=500)
+    if supplied_secret != test_secret:
+        return JSONResponse({"status": "error", "error": "Unauthorized"}, status_code=401)
+
+    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": "🦈 Shark BTC SMC — Telegram test successful!\n\nBinance + Bybit connector is live.",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(telegram_url, json=payload)
+            data = response.json()
+        if response.is_success and data.get("ok") is True:
+            return JSONResponse({"status": "ok", "telegram": "message_sent"})
+        return JSONResponse({"status": "error", "error": data.get("description", "Telegram API request failed")}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "error": f"Telegram request failed: {type(exc).__name__}: {exc}"}, status_code=502)
+
+
 public_app = Starlette(routes=[
     Route("/", health, methods=["GET"]),
     Route("/health", health, methods=["GET"]),
     Route("/api/smc", public_smc, methods=["GET"]),
+    Route("/test-telegram", test_telegram, methods=["GET"]),
     Mount("/mcp", app=mcp.http_app(path="/mcp", transport="streamable-http")),
 ])
 
